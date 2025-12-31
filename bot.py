@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import random
+import warnings
 from datetime import datetime
 
 # Third-party imports
@@ -22,6 +23,10 @@ from telegram.request import HTTPXRequest
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from fake_useragent import UserAgent
 
+# 🟢 FIX: Silence the annoying PTBUserWarning
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
+
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 
@@ -30,7 +35,6 @@ HEADLESS_MODE = True
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180")) 
 USER_DATA_DIR = "./browser_data" 
 
-# Database Path
 if os.path.exists("/app/data"):
     DB_FILE = "/app/data/monitor.db"
 else:
@@ -38,7 +42,6 @@ else:
 
 # ================= LOGGING =================
 sys.stdout.reconfigure(encoding='utf-8')
-
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", 
     level=logging.INFO,
@@ -120,7 +123,7 @@ class Database:
 
 db = Database(DB_FILE)
 
-# ================= BROWSER MANAGER (ROBUST SEARCH) =================
+# ================= BROWSER MANAGER =================
 class BrowserManager:
     def __init__(self):
         self.ua = UserAgent()
@@ -132,8 +135,7 @@ class BrowserManager:
             "--no-sandbox",
             "--disable-dev-shm-usage", 
             "--disable-gpu",
-            "--disable-extensions",
-            "--window-size=1920,1080", # HD Res helps with layout
+            "--window-size=1920,1080",
         ]
 
     async def search_movie(self, query):
@@ -144,37 +146,22 @@ class BrowserManager:
                 page = await context.new_page()
                 
                 logger.info(f"🔎 Searching: {query}")
-                # 1. Go to Home
                 await page.goto("https://in.bookmyshow.com/explore/home/", timeout=60000)
                 
-                # 2. Aggressively find search bar
+                # Try multiple ways to find search
                 search_found = False
-                potential_selectors = [
-                    "input[type='text']", 
-                    "span#4", 
-                    "div.sc-fFTswy", # Common random class
-                    "span:has-text('Search')",
-                ]
-                
-                for selector in potential_selectors:
+                selectors = ["input[type='text']", "span#4", "span:has-text('Search')"]
+                for s in selectors:
                     try:
-                        if await page.locator(selector).first.is_visible(timeout=2000):
-                            await page.locator(selector).first.click(timeout=1000)
+                        if await page.locator(s).first.is_visible(timeout=2000):
+                            await page.locator(s).first.click()
                             search_found = True
                             break
                     except: continue
-
-                # Fallback: Just type if we think we are focused, or force click center
-                if not search_found:
-                    logger.warning("⚠️ Search bar elusive, trying generic input fill...")
                 
-                # 3. Type and Wait
                 await page.locator("input").fill(query)
-                
-                # 4. Wait longer for AJAX results (Cloud is slow)
-                await asyncio.sleep(5) 
+                await asyncio.sleep(6) # Increased wait for cloud lag
 
-                # 5. Extract
                 await page.wait_for_selector("a[href*='/movies/']", timeout=15000)
                 links = await page.locator("a[href*='/movies/']").all()
 
@@ -209,7 +196,6 @@ class BrowserManager:
                 if response.status == 403:
                     raise Exception("403 Forbidden")
 
-                # Handle City Selection
                 try:
                     if await page.get_by_placeholder("Search for your city").is_visible(timeout=5000):
                         await page.get_by_placeholder("Search for your city").fill(city)
@@ -217,21 +203,14 @@ class BrowserManager:
                         await asyncio.sleep(3)
                 except: pass
 
-                # Check for "No Shows" or "Venues"
-                try:
-                    # Wait for container to stabilize
-                    await asyncio.sleep(3)
-                    
-                    if await page.get_by_text("No shows available").is_visible():
-                        pass # Valid result, just empty
-                    else:
-                        venue_elements = await page.locator("li.list-group-item").all()
-                        for venue in venue_elements:
-                            name = await venue.locator("a.body-text").first.inner_text()
-                            times = await venue.locator(".showtime-pill .time-text").all_inner_texts()
-                            if times:
-                                data[name] = sorted([t.strip() for t in times])
-                except: pass
+                await asyncio.sleep(3)
+                if not await page.get_by_text("No shows available").is_visible():
+                    venue_elements = await page.locator("li.list-group-item").all()
+                    for venue in venue_elements:
+                        name = await venue.locator("a.body-text").first.inner_text()
+                        times = await venue.locator(".showtime-pill .time-text").all_inner_texts()
+                        if times:
+                            data[name] = sorted([t.strip() for t in times])
                 
                 await browser.close()
             except Exception as e:
@@ -243,7 +222,7 @@ class BrowserManager:
 browser_manager = BrowserManager()
 
 # ================= HANDLERS =================
-SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE = range(4)
+SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE, MANUAL_URL = range(5)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_user(update.effective_user.id, update.effective_chat.id)
@@ -256,14 +235,28 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("🔎 Searching... (Waiting 10s for results)")
     results = await browser_manager.search_movie(update.message.text)
+    
+    # 🟢 FIX: If search fails, ask for URL directly
     if not results:
-        await msg.edit_text("❌ No movies found. Try searching for a simpler term (e.g. 'Jana').")
-        return SEARCH
+        await msg.edit_text("❌ No movies found via search.\n\n🔗 **Please paste the full BookMyShow movie link:**")
+        return MANUAL_URL
     
     keyboard = [[InlineKeyboardButton(r['title'], callback_data=f"m_{i}")] for i, r in enumerate(results)]
     context.user_data["results"] = results
     await msg.edit_text("Select Movie:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECT_MOVIE
+
+# 🟢 NEW: Handles Manual Link Parsing
+async def manual_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if "bookmyshow.com" not in url:
+        await update.message.reply_text("❌ Invalid Link. Please paste a valid BookMyShow URL:")
+        return MANUAL_URL
+    
+    # Fake a movie object
+    context.user_data["movie"] = {"title": "Manual Selection", "url": url}
+    await update.message.reply_text(f"✅ Link Accepted!\n\n📍 Enter City (e.g., Chennai):")
+    return SELECT_CITY
 
 async def movie_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -344,7 +337,6 @@ def main():
     
     db.init_db()
     
-    # 60s timeout for stability
     request = HTTPXRequest(connect_timeout=60, read_timeout=60)
     app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
@@ -352,6 +344,7 @@ def main():
         entry_points=[CommandHandler("setup", setup_start)],
         states={
             SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler)],
+            MANUAL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_url_handler)],
             SELECT_MOVIE: [CallbackQueryHandler(movie_select_handler)],
             SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
             SELECT_MODE: [CallbackQueryHandler(mode_handler)]
@@ -365,13 +358,12 @@ def main():
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
 
-    print("🚀 Bot Started (Conflict Handled + Robust Search)")
+    print("🚀 Bot Started (Clean Logs + Link Support)")
     
-    # Conflict Handling: If the old bot is still dying, we catch the error and retry
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except telegram_error.Conflict:
-        logger.warning("⚠️ Conflict detected (Old bot still running). Retrying in 10 seconds...")
+        logger.warning("⚠️ Conflict detected. Retrying...")
         import time
         time.sleep(10)
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
