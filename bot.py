@@ -2,25 +2,34 @@ import asyncio
 import logging
 import os
 import random
-from datetime import datetime
 
 # Telegram Imports
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError
 
 # Playwright Imports
 from playwright.async_api import async_playwright
 from fake_useragent import UserAgent
 
-# --- CONFIGURATION ---
-# 1. Get these from Railway Variables or hardcode them for testing
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # Add this in Railway Variables
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID") # Add this in Railway Variables
+# --- CONFIGURATION (UPDATED WITH YOUR VALUES) ---
+# We look for the Environment Variable first. If not found, we use your hardcoded value.
 
-# 2. Movie Details (From your logs)
-MOVIE_URL = "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109"
+# 1. Bot Token
+TOKEN = os.getenv("BOT_TOKEN", "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg")
+
+# 2. Movie URL
+MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109")
+
+# 3. Check Interval (in seconds)
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
+
+# 4. Scraper API Key (Optional Proxy)
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "099ee81831f919a57cce86729ef5bef7")
+
+# 5. Target Chat ID (You still need to set this in Railway or find it via /start)
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID") 
+
 MOVIE_NAME = "Jana Nayagan"
 
 # --- LOGGING SETUP ---
@@ -28,7 +37,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-# Reduce noise from third-party libraries
+# Reduce noise
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -37,16 +46,27 @@ logger = logging.getLogger(__name__)
 async def check_ticket_availability():
     """
     Checks the BookMyShow URL for ticket availability using Playwright.
-    Returns True if tickets are found (booking button is active), False otherwise.
+    Uses ScraperAPI proxy if available to avoid blocks.
     """
     ua = UserAgent()
     user_agent = ua.random
     
+    # Configure Proxy if API Key is present
+    proxy_config = None
+    if SCRAPER_API_KEY:
+        logger.info("🛡️ Using ScraperAPI Proxy for protection...")
+        proxy_config = {
+            "server": "http://proxy-server.scraperapi.com:8001",
+            "username": "scraperapi",
+            "password": SCRAPER_API_KEY
+        }
+
     async with async_playwright() as p:
-        # Launch browser (headless for Railway)
         try:
+            # Launch browser
             browser = await p.chromium.launch(
                 headless=True,
+                proxy=proxy_config, # Use the proxy
                 args=[
                     '--no-sandbox', 
                     '--disable-setuid-sandbox', 
@@ -55,37 +75,43 @@ async def check_ticket_availability():
                 ]
             )
             
-            context = await browser.new_context(user_agent=user_agent)
+            # Create a new context with a realistic user agent and viewport
+            context = await browser.new_context(
+                user_agent=user_agent,
+                viewport={'width': 1280, 'height': 800}
+            )
+            
+            # ScraperAPI specific: verify SSL=False often helps with proxies
+            if SCRAPER_API_KEY:
+                context.set_default_timeout(60000) # Give proxy more time
+
             page = await context.new_page()
 
             logger.info(f"🔎 Checking BMS for: {MOVIE_NAME}")
             
-            # Set a rigorous timeout for loading the page
-            await page.goto(MOVIE_URL, timeout=60000, wait_until="domcontentloaded")
+            # Go to the URL
+            # wait_until="commit" is faster, "domcontentloaded" is safer
+            await page.goto(MOVIE_URL, timeout=90000, wait_until="domcontentloaded")
             
             # --- SCRAPING LOGIC ---
-            # Wait for the main container or specific indicators of availability.
-            # BookMyShow usually has a 'Book tickets' button or showtime pills.
-            # If the page says "Coming Soon" or has no showtimes, we return False.
-            
-            # We look for the existence of showtime elements (generic class check)
-            # Adjust this selector if BMS changes their layout
+            # Check for specific "Book" buttons or showtime availability
             try:
-                # Wait up to 10 seconds for a "book ticket" related element or showtime list
-                # This selector looks for showtime links/buttons
+                # Look for the 'Book tickets' button or showtime pills
+                # We wait up to 15s because proxies can be slightly slower
                 found_showtimes = await page.wait_for_selector(
-                    "a.showtime-pill, .showtime-pill, button:has-text('Book')", 
-                    timeout=10000
+                    "a.showtime-pill, .showtime-pill, button:has-text('Book'), #showtimes", 
+                    timeout=15000
                 )
                 
                 if found_showtimes:
                     logger.info("🎉 TICKETS DETECTED! Found showtime elements.")
                     screenshot_path = "success.png"
                     await page.screenshot(path=screenshot_path)
+                    await browser.close()
                     return True, screenshot_path
                 
             except Exception:
-                logger.info("ℹ️ No showtimes found (Timeout waiting for selector).")
+                logger.info("ℹ️ No showtimes found (Selector timeout).")
             
             await browser.close()
             return False, None
@@ -97,44 +123,44 @@ async def check_ticket_availability():
 # --- BACKGROUND TASK ---
 async def monitor_task(app: Application):
     """
-    Continuous loop that checks for tickets every few minutes.
+    Continuous loop that checks for tickets based on CHECK_INTERVAL.
     """
-    logger.info("🟢 Monitor Task Started")
+    logger.info(f"🟢 Monitor Task Started. Checking every {CHECK_INTERVAL} seconds.")
     
-    # Wait a bit on startup to let the bot initialize fully
+    # Initial warm-up wait
     await asyncio.sleep(10)
 
     while True:
         try:
             tickets_found, screenshot = await check_ticket_availability()
 
-            if tickets_found and TARGET_CHAT_ID:
+            if tickets_found:
                 msg = (
                     f"🚨 <b>TICKETS AVAILABLE!</b> 🚨\n\n"
                     f"🎬 <b>Movie:</b> {MOVIE_NAME}\n"
                     f"🔗 <a href='{MOVIE_URL}'>Book Now on BookMyShow</a>"
                 )
                 
-                # Send text alert
-                await app.bot.send_message(
-                    chat_id=TARGET_CHAT_ID, 
-                    text=msg, 
-                    parse_mode='HTML'
-                )
+                # Alert the user if Chat ID is set
+                if TARGET_CHAT_ID:
+                    await app.bot.send_message(
+                        chat_id=TARGET_CHAT_ID, 
+                        text=msg, 
+                        parse_mode='HTML'
+                    )
 
-                # Send screenshot if available
-                if screenshot and os.path.exists(screenshot):
-                    await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=open(screenshot, 'rb'))
-                    os.remove(screenshot)
+                    if screenshot and os.path.exists(screenshot):
+                        await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=open(screenshot, 'rb'))
+                        os.remove(screenshot)
+                else:
+                    logger.warning("Tickets found, but TARGET_CHAT_ID is not set! Check Railway variables.")
                 
-                # If found, maybe slow down checks or stop? 
-                # For now, we sleep longer to avoid spamming yourself
+                # Sleep for 10 minutes if found to avoid spamming
                 await asyncio.sleep(600) 
 
             else:
-                logger.info("❌ No tickets found yet.")
-                # Wait random time between 3-5 minutes to behave like a human
-                await asyncio.sleep(random.randint(180, 300))
+                logger.info(f"❌ No tickets. Sleeping for {CHECK_INTERVAL}s...")
+                await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
             logger.error(f"⚠️ Error in main loop: {e}")
@@ -142,28 +168,27 @@ async def monitor_task(app: Application):
 
 # --- COMMAND HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    chat_id = update.effective_chat.id
     await update.message.reply_html(
-        f"👋 Hi {user.mention_html()}!\n\n"
-        f"I am monitoring <b>{MOVIE_NAME}</b>.\n"
-        f"I will alert you here: {update.effective_chat.id}\n\n"
-        f"<i>(Make sure to set this Chat ID in your environment variables if different)</i>"
+        f"👋 Bot is Online!\n\n"
+        f"Monitoring: <b>{MOVIE_NAME}</b>\n"
+        f"Check Interval: <b>{CHECK_INTERVAL}s</b>\n"
+        f"Proxy Enabled: <b>{'Yes' if SCRAPER_API_KEY else 'No'}</b>\n\n"
+        f"🆔 Your Chat ID: <code>{chat_id}</code>\n"
+        f"<i>(Copy this ID and add it to Railway variables as TARGET_CHAT_ID if you haven't already!)</i>"
     )
 
 # --- MAIN SETUP ---
 def main():
     if not TOKEN:
-        logger.critical("❌ FATAL: TELEGRAM_BOT_TOKEN is missing!")
+        logger.critical("❌ FATAL: BOT_TOKEN is missing!")
         return
 
-    # [CRITICAL FIX] Advanced Network Configuration for Railway
-    # ---------------------------------------------------------
-    # This specifically fixes the 'httpx.ConnectTimeout' and 
-    # 'RuntimeError: ExtBot is not properly initialized' errors.
+    # Advanced Network Configuration (Fixes Railway Timeouts)
     request_config = HTTPXRequest(
         connection_pool_size=8,
-        connect_timeout=60.0,  # Increased from 5s to 60s
-        read_timeout=60.0,     # Increased from 5s to 60s
+        connect_timeout=60.0,
+        read_timeout=60.0,
         write_timeout=60.0,
         pool_timeout=60.0,
     )
@@ -172,8 +197,8 @@ def main():
     application = (
         ApplicationBuilder()
         .token(TOKEN)
-        .request(request_config)  # Apply network fixes
-        .get_updates_http_version("1.1") # Force HTTP/1.1 for stability
+        .request(request_config)
+        .get_updates_http_version("1.1")
         .build()
     )
 
@@ -186,12 +211,9 @@ def main():
     
     application.post_init = post_init
 
-    logger.info("🚀 Bot is starting with Advanced Network Repair...")
+    logger.info("🚀 Bot is starting...")
 
-    # [CRITICAL FIX] Run Polling with Retry Logic
-    # -------------------------------------------
-    # bootstrap_retries=-1 prevents the bot from crashing if it
-    # fails to connect to Telegram immediately on startup.
+    # Infinite retry loop on startup (Fixes initialization crashes)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
