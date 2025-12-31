@@ -1,142 +1,93 @@
-import requests
-import time
 import os
-import hashlib
+import time
 import threading
-from collections import defaultdict
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MOVIE_CODE = os.getenv("MOVIE_CODE")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "12"))
+MOVIE_CODE = os.getenv("MOVIE_CODE")  # ET00430817
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
 
 if not BOT_TOKEN or not MOVIE_CODE:
     raise RuntimeError("Missing BOT_TOKEN or MOVIE_CODE")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Store user selections
+USER_DATA = {}
 
-# ================= STORAGE =================
-user_state = {}              # chat_id -> state
-user_cities = defaultdict(set)  # chat_id -> set(cities)
-page_fingerprint = defaultdict(dict)  # chat_id -> city -> hash
+print("🟢 Telegram BookMyShow bot started")
 
-# ================= HELPERS =================
-def send(chat_id, text, keyboard=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    requests.post(f"{TG_API}/sendMessage", json=payload, timeout=10)
+# ================= TELEGRAM HANDLERS =================
 
-def get_states_and_cities():
-    """
-    Fetches all states and cities from BookMyShow
-    """
-    url = "https://in.bookmyshow.com/api/explore/v1/discover/regions"
-    data = requests.get(url, timeout=10).json()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Tamil Nadu", callback_data="state:Tamil Nadu")],
+        [InlineKeyboardButton("Karnataka", callback_data="state:Karnataka")],
+        [InlineKeyboardButton("Kerala", callback_data="state:Kerala")],
+        [InlineKeyboardButton("Andhra Pradesh", callback_data="state:Andhra Pradesh")]
+    ]
+    await update.message.reply_text(
+        "📍 Select your STATE:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-    states = defaultdict(list)
-    for r in data.get("regions", []):
-        state = r.get("state")
-        city = r.get("slug")
-        if state and city:
-            states[state].append(city)
+async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    return states
+    data = query.data
 
-def fingerprint(html):
-    lines = [l for l in html.splitlines() if "/buytickets/" in l]
-    return hashlib.md5("".join(lines).encode()).hexdigest()
+    if data.startswith("state:"):
+        state = data.split(":", 1)[1]
+        USER_DATA[query.from_user.id] = {"state": state}
 
-# ================= BOT LOOP =================
-def bot_loop():
-    offset = None
-    states = get_states_and_cities()
-
-    while True:
-        updates = requests.get(
-            f"{TG_API}/getUpdates",
-            params={"timeout": 20, "offset": offset},
-            timeout=25
-        ).json()
-
-        for upd in updates.get("result", []):
-            offset = upd["update_id"] + 1
-            msg = upd.get("message")
-            if not msg:
-                continue
-
-            chat_id = msg["chat"]["id"]
-            text = msg.get("text", "")
-
-            if text == "/start":
-                kb = {
-                    "keyboard": [[s] for s in sorted(states.keys())],
-                    "resize_keyboard": True,
-                    "one_time_keyboard": True
-                }
-                send(chat_id, "📍 Select your STATE:", kb)
-
-            elif text in states:
-                user_state[chat_id] = text
-                cities = states[text]
-                kb = {
-                    "keyboard": [[c] for c in cities],
-                    "resize_keyboard": True,
-                    "one_time_keyboard": True
-                }
-                send(chat_id, f"🏙 Select CITY in {text}:", kb)
-
-            elif chat_id in user_state and text in states[user_state[chat_id]]:
-                user_cities[chat_id].add(text)
-                send(
-                    chat_id,
-                    f"✅ Monitoring started\n\n"
-                    f"State: {user_state[chat_id]}\n"
-                    f"City: {text}\n\n"
-                    f"You’ll get alerts when new shows are added 🎬"
-                )
-
-        time.sleep(1)
+        await query.edit_message_text(
+            f"✅ State selected: {state}\n\n🎬 Monitoring started!\nYou’ll get alerts when new shows/theatres are added."
+        )
 
 # ================= MONITOR LOOP =================
-def monitor_loop():
+
+def monitor_loop(app):
+    last_seen = set()
+
     while True:
-        for chat_id, cities in user_cities.items():
-            for city in cities:
-                try:
-                    url = f"https://in.bookmyshow.com/movies/{city}/jana-nayagan/buytickets/{MOVIE_CODE}"
-                    r = requests.get(url, timeout=10)
-                    if r.status_code != 200:
-                        continue
+        try:
+            url = f"https://in.bookmyshow.com/buytickets/{MOVIE_CODE}"
+            headers = {
+                "User-Agent": "Mozilla/5.0"
+            }
 
-                    fp = fingerprint(r.text)
+            r = requests.get(url, headers=headers, timeout=15)
+            content = r.text
 
-                    if city not in page_fingerprint[chat_id]:
-                        page_fingerprint[chat_id][city] = fp
-                        continue
+            # Very basic change detection
+            if content and hash(content) not in last_seen:
+                last_seen.add(hash(content))
 
-                    if fp != page_fingerprint[chat_id][city]:
-                        send(
-                            chat_id,
-                            f"🚨 NEW SHOW / THEATRE ADDED!\n\n"
-                            f"🏙 City: {city.capitalize()}\n"
-                            f"🎬 Jana Nayagan\n\n"
-                            f"🔗 {url}"
-                        )
-                        page_fingerprint[chat_id][city] = fp
+                for user_id in USER_DATA:
+                    app.bot.send_message(
+                        chat_id=user_id,
+                        text="🚨 New update detected for *Jana Nayagan*!\nCheck BookMyShow now 👀",
+                        parse_mode="Markdown"
+                    )
 
-                except Exception as e:
-                    print("Monitor error:", e)
+        except Exception as e:
+            print("⚠ Monitor error:", e)
 
         time.sleep(CHECK_INTERVAL)
 
-# ================= START =================
-send_me = lambda msg: print(msg)
-send_me("🟢 Telegram BookMyShow bot started")
+# ================= MAIN =================
 
-threading.Thread(target=bot_loop, daemon=True).start()
-monitor_loop()
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_selection))
+
+    threading.Thread(target=monitor_loop, args=(app,), daemon=True).start()
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
