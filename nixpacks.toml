@@ -1,5 +1,8 @@
+[variables]
+PLAYWRIGHT_BROWSERS_PATH = "/app/pw-browsers"
+
 [phases.setup]
-nixPkgs = ["python311", "chromium", "nss", "freetype", "fontconfig"]
+nixPkgs = ["python311", "chromium", "glib", "nss", "freetype", "fontconfig"]
 
 [phases.install]
 cmds = [
