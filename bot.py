@@ -1,129 +1,122 @@
 import os
 import time
+import json
 import threading
-import hashlib
 import requests
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= CONFIG =================
+# ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MOVIE_CODE = os.getenv("MOVIE_CODE")  # ET00430817
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "2"))
+MOVIE_CODE = os.getenv("MOVIE_CODE")
+CITY = os.getenv("CITY", "bengaluru")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
 if not BOT_TOKEN or not MOVIE_CODE:
     raise RuntimeError("Missing BOT_TOKEN or MOVIE_CODE")
 
-USER_DATA = {}          # user_id → state
-SEEN_SHOWS = set()      # fingerprints
+# ================== GLOBALS ==================
+BASE_URL = f"https://in.bookmyshow.com/movies/{CITY}/jana-nayagan/buytickets/{MOVIE_CODE}"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+last_fingerprint = set()
+subscribers = set()
 
-print("🟢 Telegram BookMyShow bot started")
-
-# ================= TELEGRAM =================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Tamil Nadu", callback_data="state:Tamil Nadu")],
-        [InlineKeyboardButton("Karnataka", callback_data="state:Karnataka")],
-        [InlineKeyboardButton("Kerala", callback_data="state:Kerala")],
-        [InlineKeyboardButton("Andhra Pradesh", callback_data="state:Andhra Pradesh")]
-    ]
-    await update.message.reply_text(
-        "📍 Select your STATE to start monitoring:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    state = query.data.split(":", 1)[1]
-    USER_DATA[query.from_user.id] = state
-
-    await query.edit_message_text(
-        f"✅ State selected: *{state}*\n\n"
-        "🎬 Live monitoring started.\n"
-        "You’ll be notified ONLY when:\n"
-        "• New theatre added\n"
-        "• New show date\n"
-        "• New show timing",
-        parse_mode="Markdown"
-    )
-
-# ================= SCRAPER =================
-
+# ================== HELPERS ==================
 def fetch_shows():
-    url = f"https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/{MOVIE_CODE}"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    """Scrape BookMyShow and return a set fingerprint"""
+    try:
+        res = requests.get(BASE_URL, headers=HEADERS, timeout=15)
+        if res.status_code != 200:
+            return set()
 
-    r = requests.get(url, headers=headers, timeout=15)
-    soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(res.text, "html.parser")
+        fingerprint = set()
 
-    results = []
+        theatres = soup.select('[data-testid="theatre-card"]')
+        for theatre in theatres:
+            name_el = theatre.select_one("h3, h4")
+            if not name_el:
+                continue
 
-    theatres = soup.select("div.__venue-name")
-    for theatre in theatres:
-        theatre_name = theatre.get_text(strip=True)
+            theatre_name = name_el.get_text(strip=True)
 
-        parent = theatre.find_parent("div", class_="__venue-details")
-        if not parent:
-            continue
+            shows = theatre.select("a[href*='/buytickets/']")
+            for show in shows:
+                show_time = show.get_text(strip=True)
+                link = show.get("href").split("?")[0]
+                fingerprint.add(f"{theatre_name} | {show_time} | {link}")
 
-        times = parent.select("a.showtime-pill")
+        return fingerprint
+    except Exception as e:
+        print("SCRAPE ERROR:", e)
+        return set()
 
-        for t in times:
-            show_time = t.get_text(strip=True)
-            fingerprint = f"{theatre_name}|{show_time}"
-            results.append(fingerprint)
-
-    return results
-
-# ================= MONITOR =================
-
+# ================== MONITOR LOOP ==================
 def monitor_loop(app):
-    global SEEN_SHOWS
+    global last_fingerprint
+    print("🟢 Monitor started")
 
     while True:
-        try:
-            shows = fetch_shows()
+        current = fetch_shows()
 
-            for show in shows:
-                h = hashlib.md5(show.encode()).hexdigest()
+        if current and last_fingerprint:
+            new_items = current - last_fingerprint
 
-                if h not in SEEN_SHOWS:
-                    SEEN_SHOWS.add(h)
+            if new_items:
+                theatres = {i.split("|")[0].strip() for i in new_items}
+                message = (
+                    "🎬 *Jana Nayagan – New Shows Added!*\n\n"
+                    f"🎭 Theatres: {len(theatres)}\n"
+                    f"🎟 Shows: {len(new_items)}\n\n"
+                    f"🔗 {BASE_URL}"
+                )
 
-                    theatre, time_str = show.split("|")
-
-                    for user_id in USER_DATA:
+                for chat_id in subscribers:
+                    try:
                         app.bot.send_message(
-                            chat_id=user_id,
-                            text=(
-                                "🚨 *NEW SHOW DETECTED*\n\n"
-                                f"🎭 Theatre: {theatre}\n"
-                                f"⏰ Time: {time_str}\n\n"
-                                "👉 Book now on BookMyShow!"
-                            ),
+                            chat_id=chat_id,
+                            text=message,
                             parse_mode="Markdown"
                         )
+                    except Exception as e:
+                        print("SEND ERROR:", e)
 
-        except Exception as e:
-            print("⚠ Monitor error:", e)
-
+        last_fingerprint = current
         time.sleep(CHECK_INTERVAL)
 
-# ================= MAIN =================
+# ================== COMMANDS ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subscribers.add(chat_id)
+    await update.message.reply_text(
+        "🟢 Jana Nayagan Monitor Activated\n\n"
+        "You will receive alerts when NEW theatres or shows are added.\n"
+        f"⏱ Checking every {CHECK_INTERVAL} seconds."
+    )
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🟢 Bot is running\n"
+        f"City: {CITY}\n"
+        f"Movie Code: {MOVIE_CODE}\n"
+        f"Interval: {CHECK_INTERVAL}s"
+    )
+
+# ================== MAIN ==================
 def main():
+    print("🟢 Telegram BookMyShow bot started")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_selection))
+    app.add_handler(CommandHandler("status", status))
 
-    threading.Thread(target=monitor_loop, args=(app,), daemon=True).start()
+    # Background monitor thread
+    thread = threading.Thread(target=monitor_loop, args=(app,), daemon=True)
+    thread.start()
 
     app.run_polling()
 
