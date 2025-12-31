@@ -1,61 +1,72 @@
 import asyncio
 import logging
 import os
-import random
-import subprocess
 import sys
+import subprocess
+import random
 
 # Telegram Imports
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 from telegram.request import HTTPXRequest
 
-# Playwright & Stealth Imports
+# Playwright Imports
 from playwright.async_api import async_playwright
-# If you don't have playwright-stealth, remove the import and the await stealth_async(page) line
-try:
-    from playwright_stealth import stealth_async
-except ImportError:
-    stealth_async = None
-
 from fake_useragent import UserAgent
 
+# Try importing stealth, but don't crash if missing
+try:
+    from playwright_stealth import stealth_async
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
+
 # --- CONFIGURATION ---
-TOKEN = os.getenv("BOT_TOKEN", "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg")
+TOKEN = os.getenv("BOT_TOKEN")
+# If you didn't set variables, use these fallbacks (replace with your own if needed)
+if not TOKEN:
+    TOKEN = "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg"
+
 MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "099ee81831f919a57cce86729ef5bef7")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY") # Optional
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 MOVIE_NAME = "Jana Nayagan"
 
-# --- LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# Silence noisy logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- AUTO-INSTALLER (THE FIX) ---
+# --- [CRITICAL FIX] AUTO-INSTALLER ---
 def install_browser():
     """
-    Automatically installs Chromium if missing.
-    This fixes the 'Executable doesn't exist' error.
+    Checks and installs the Chromium browser automatically.
+    This FIXES the 'Executable doesn't exist' error.
     """
-    logger.info("⬇️ Checking/Installing Playwright Browsers...")
+    logger.info("⬇️ System Check: Verifying Browser...")
     try:
-        # Installs just Chromium to save space/time
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-        logger.info("✅ Browser installation successful.")
+        # This command installs the chromium binary required by Playwright
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"], 
+            check=True
+        )
+        logger.info("✅ Browser installed successfully.")
     except Exception as e:
-        logger.error(f"⚠️ Failed to install browser: {e}")
+        logger.error(f"⚠️ Browser installation warning: {e}")
+        # We continue anyway, as it might already be installed in a different path
 
-# --- BROWSER MANAGEMENT ---
+# --- BROWSER LOGIC ---
 async def check_ticket_availability():
     ua = UserAgent()
     user_agent = ua.random
 
+    # Proxy Config
     proxy_config = None
     if SCRAPER_API_KEY:
         logger.info("🛡️ Using ScraperAPI Proxy...")
@@ -68,6 +79,7 @@ async def check_ticket_availability():
     async with async_playwright() as p:
         try:
             # Launch Browser
+            # We explicitly use chromium which is lighter and faster
             browser = await p.chromium.launch(
                 headless=True,
                 proxy=proxy_config,
@@ -86,32 +98,32 @@ async def check_ticket_availability():
             )
 
             if SCRAPER_API_KEY:
-                context.set_default_timeout(60000) 
+                context.set_default_timeout(60000)
 
             page = await context.new_page()
             
-            # Apply Stealth if available
-            if stealth_async:
+            # Apply Stealth if installed
+            if STEALTH_AVAILABLE:
                 await stealth_async(page)
 
             logger.info(f"🔎 Checking BMS for: {MOVIE_NAME}")
-            
+
             try:
                 await page.goto(MOVIE_URL, timeout=90000, wait_until="domcontentloaded")
-            except Exception as e:
-                logger.warning(f"⚠️ Page load slow ({e}), checking selectors anyway...")
+            except Exception:
+                logger.warning("⚠️ Page load timeout, checking selectors anyway...")
 
-            # --- SMART SELECTORS ---
+            # --- SELECTOR LOGIC ---
+            # We look for POSITIVE signs (Booking buttons)
             try:
-                # Look for booking buttons/links
                 found_element = await page.wait_for_selector(
                     "a.showtime-pill, .showtime-pill-container, button:has-text('Book'), a[href*='buytickets']",
-                    state="visible",
+                    state="visible", 
                     timeout=20000
                 )
 
                 if found_element:
-                    # Check if 'Sold Out' text exists nearby
+                    # Double check for "Sold Out" text
                     is_sold_out = await page.query_selector("text=Sold Out")
                     if not is_sold_out:
                         logger.info("🎉 TICKETS DETECTED!")
@@ -119,14 +131,9 @@ async def check_ticket_availability():
                         await page.screenshot(path=screenshot_path)
                         await browser.close()
                         return True, screenshot_path
-                
+
             except Exception:
-                # Check for "Coming Soon"
-                content = await page.content()
-                if "Coming Soon" in content:
-                    logger.info("ℹ️ Status: Coming Soon")
-                else:
-                    logger.info("ℹ️ No showtimes found.")
+                logger.info("ℹ️ No showtimes found.")
 
             await browser.close()
             return False, None
@@ -135,10 +142,10 @@ async def check_ticket_availability():
             logger.error(f"⚠️ Browser Error: {e}")
             return False, None
 
-# --- BACKGROUND TASK ---
+# --- BOT TASK ---
 async def monitor_task(app: Application):
     logger.info(f"🟢 Monitor Task Started. Checking every {CHECK_INTERVAL}s")
-    await asyncio.sleep(10) 
+    await asyncio.sleep(10)
 
     while True:
         try:
@@ -148,47 +155,45 @@ async def monitor_task(app: Application):
                 msg = (
                     f"🚨 <b>TICKETS AVAILABLE!</b> 🚨\n\n"
                     f"🎬 <b>Movie:</b> {MOVIE_NAME}\n"
-                    f"🔗 <a href='{MOVIE_URL}'>Book Now on BookMyShow</a>"
+                    f"🔗 <a href='{MOVIE_URL}'>Book Now</a>"
                 )
-
+                
                 if TARGET_CHAT_ID:
                     try:
                         await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg, parse_mode='HTML')
                         if screenshot and os.path.exists(screenshot):
-                            await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=open(screenshot, 'rb'))
+                            with open(screenshot, 'rb') as photo:
+                                await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo)
                             os.remove(screenshot)
                     except Exception as e:
                         logger.error(f"❌ Telegram Error: {e}")
                 
-                await asyncio.sleep(900) # Wait 15 mins if found
-
+                await asyncio.sleep(900) # Sleep 15 mins if found
             else:
-                sleep_time = CHECK_INTERVAL + random.randint(5, 30)
-                await asyncio.sleep(sleep_time)
+                # Random jitter to avoid detection
+                await asyncio.sleep(CHECK_INTERVAL + random.randint(1, 15))
 
         except Exception as e:
             logger.error(f"⚠️ Loop Error: {e}")
             await asyncio.sleep(60)
 
-# --- COMMANDS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     await update.message.reply_html(
-        f"👋 <b>Bot Online!</b>\n"
+        f"👋 <b>Bot is Online!</b>\n"
         f"Monitoring: {MOVIE_NAME}\n"
-        f"Chat ID: <code>{chat_id}</code>"
+        f"Chat ID: <code>{update.effective_chat.id}</code>"
     )
 
 # --- MAIN ---
 def main():
-    # 1. RUN AUTO-INSTALLER FIRST
+    # 1. INSTALL BROWSER FIRST
     install_browser()
 
     if not TOKEN:
         logger.critical("❌ FATAL: BOT_TOKEN is missing!")
         return
 
-    # 2. NETWORK CONFIG (Fixes Railway Crashes)
+    # 2. NETWORK CONFIG (Robust)
     request_config = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=60.0,
@@ -213,8 +218,7 @@ def main():
     application.post_init = post_init
 
     logger.info("🚀 Bot is starting...")
-
-    # 3. RUN WITH RETRIES
+    
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
