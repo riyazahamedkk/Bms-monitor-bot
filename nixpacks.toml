@@ -1,0 +1,12 @@
+[phases.setup]
+nixPkgs = ["python311", "chromium", "nss", "freetype", "fontconfig"]
+
+[phases.install]
+cmds = [
+    "pip install -r requirements.txt",
+    "playwright install chromium",
+    "playwright install-deps chromium"
+]
+
+[start]
+cmd = "python bot.py"
