@@ -8,23 +8,22 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
 from telegram.request import HTTPXRequest
 
-# Playwright Imports
+# Playwright & Stealth Imports
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
 # 1. Bot Token
-# Get from Railway Variables or use default
 TOKEN = os.getenv("BOT_TOKEN", "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg")
 
 # 2. Movie URL
 MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109")
 
-# 3. Check Interval (in seconds)
+# 3. Check Interval (Default 120s)
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 
-# 4. Scraper API Key (Proxy)
-# I included your key here as a fallback, but it's better to use Railway Variables.
+# 4. Scraper API Key (Optional Proxy)
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "099ee81831f919a57cce86729ef5bef7")
 
 # 5. Target Chat ID
@@ -45,13 +44,13 @@ logger = logging.getLogger(__name__)
 # --- BROWSER MANAGEMENT ---
 async def check_ticket_availability():
     """
-    Checks BookMyShow for tickets. 
+    Checks BookMyShow for tickets using Stealth Mode.
     Returns: (bool: found?, str: screenshot_path)
     """
     ua = UserAgent()
     user_agent = ua.random
 
-    # Configure Proxy (if key exists)
+    # Configure Proxy if API Key is present
     proxy_config = None
     if SCRAPER_API_KEY:
         logger.info("🛡️ Using ScraperAPI Proxy...")
@@ -63,7 +62,7 @@ async def check_ticket_availability():
 
     async with async_playwright() as p:
         try:
-            # Launch Browser
+            # Launch Browser with arguments to mimic a real screen
             browser = await p.chromium.launch(
                 headless=True,
                 proxy=proxy_config,
@@ -72,14 +71,18 @@ async def check_ticket_availability():
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
-                    '--window-size=1280,800'
+                    '--window-size=1920,1080', # Real monitor resolution
+                    '--disable-blink-features=AutomationControlled' # Hide bot status
                 ]
             )
 
+            # Create context with high-res viewport
             context = await browser.new_context(
                 user_agent=user_agent,
-                viewport={'width': 1280, 'height': 800},
-                device_scale_factor=1
+                viewport={'width': 1920, 'height': 1080},
+                device_scale_factor=1,
+                locale='en-IN',
+                timezone_id='Asia/Kolkata'
             )
 
             # Increase timeout if using proxy
@@ -88,40 +91,46 @@ async def check_ticket_availability():
 
             page = await context.new_page()
             
+            # [CRITICAL] Apply Stealth to hide from BMS bot detection
+            await stealth_async(page)
+
             logger.info(f"🔎 Checking BMS for: {MOVIE_NAME}")
             
-            # Navigate
             try:
+                # Go to URL and wait for network to be idle (page fully loaded)
                 await page.goto(MOVIE_URL, timeout=90000, wait_until="domcontentloaded")
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception as e:
-                logger.warning(f"⚠️ Timeout loading page, but continuing to check selectors... ({e})")
+                logger.warning(f"⚠️ Page load slow, but continuing... ({e})")
 
-            # --- SMART SELECTORS ---
-            # We look for ANY indication of booking availability:
-            # 1. ".showtime-pill" -> Standard desktop showtime buttons
-            # 2. ".showtime-pill-container" -> Container for times
-            # 3. "button:has-text('Book')" -> Sometimes appears on overlays
-            # 4. "a[href*='booktickets']" -> Direct booking links
+            # --- SMART SELECTORS (Ported from robust logic) ---
+            # We look for ANY indication of booking availability.
+            # BMS changes classes often, so we use generic text/attribute matchers.
             
             try:
+                # 1. Look for generic "Book" buttons or time pills
                 found_element = await page.wait_for_selector(
-                    "a.showtime-pill, .showtime-pill, .showtime-pill-container, button:has-text('Book'), a[data-id='book-tickets']",
-                    state="attached",
+                    "a.showtime-pill, .showtime-pill-container, button:has-text('Book'), a[href*='buytickets']",
+                    state="visible",
                     timeout=20000
                 )
 
                 if found_element:
-                    logger.info("🎉 TICKETS DETECTED!")
-                    screenshot_path = "success.png"
-                    await page.screenshot(path=screenshot_path)
-                    await browser.close()
-                    return True, screenshot_path
+                    # Double check it's not "Sold Out"
+                    is_sold_out = await page.query_selector("text=Sold Out")
+                    
+                    if not is_sold_out:
+                        logger.info("🎉 TICKETS DETECTED!")
+                        screenshot_path = "success.png"
+                        await page.screenshot(path=screenshot_path)
+                        await browser.close()
+                        return True, screenshot_path
                 
             except Exception:
-                # Double check: if we see "Coming Soon" text, we know definitely NOT available
+                # Fallback: Check if the page is definitely showing "Coming Soon"
                 content = await page.content()
-                if "Coming Soon" in content or "tickets are not available" in content:
-                    logger.info("ℹ️ Status: Coming Soon / Not Available")
+                if "Coming Soon" in content:
+                    logger.info("ℹ️ Status: Coming Soon")
                 else:
                     logger.info("ℹ️ No showtimes found.")
 
@@ -129,7 +138,7 @@ async def check_ticket_availability():
             return False, None
 
         except Exception as e:
-            logger.error(f"⚠️ Critical Browser Error: {e}")
+            logger.error(f"⚠️ Browser Error: {e}")
             return False, None
 
 # --- BACKGROUND TASK ---
@@ -163,8 +172,9 @@ async def monitor_task(app: Application):
                 await asyncio.sleep(900)
 
             else:
-                # Wait for the next check
-                await asyncio.sleep(CHECK_INTERVAL)
+                # Add a small random delay to avoid looking like a robot
+                sleep_time = CHECK_INTERVAL + random.randint(5, 30)
+                await asyncio.sleep(sleep_time)
 
         except Exception as e:
             logger.error(f"⚠️ Error in main loop: {e}")
@@ -188,7 +198,7 @@ def main():
         return
 
     # [FIX] Advanced Network Config
-    # We set http_version HERE to avoid the RuntimeError you were getting.
+    # This solves the 'RuntimeError: http_version' crash you were seeing.
     request_config = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=60.0,
@@ -217,7 +227,7 @@ def main():
     logger.info("🚀 Bot is starting...")
 
     # Run Polling with Infinite Retries
-    # This prevents the bot from crashing if Railway has a network hiccup on startup.
+    # This prevents the bot from crashing if Railway has a network hiccup.
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
