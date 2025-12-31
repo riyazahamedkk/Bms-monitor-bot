@@ -13,12 +13,8 @@ from playwright.async_api import async_playwright
 from fake_useragent import UserAgent
 
 # --- CONFIGURATION ---
-# We look for the Environment Variable first.
-# If not found, we use defaults (BUT we keep your secrets out of the code!)
-
 # 1. Bot Token
-# Add 'BOT_TOKEN' to your Railway Variables
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN", "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg")
 
 # 2. Movie URL
 MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109")
@@ -27,12 +23,10 @@ MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/j
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 
 # 4. Scraper API Key (Proxy)
-# Add 'SCRAPER_API_KEY' to your Railway Variables for security.
-# We set default to None so it doesn't leak your key if you share code.
-SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", None)
+# If you have one, add SCRAPER_API_KEY to your Railway Variables.
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "099ee81831f919a57cce86729ef5bef7")
 
 # 5. Target Chat ID
-# Add 'TARGET_CHAT_ID' to your Railway Variables
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 
 MOVIE_NAME = "Jana Nayagan"
@@ -42,7 +36,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-# Reduce noise
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -51,15 +44,14 @@ logger = logging.getLogger(__name__)
 async def check_ticket_availability():
     """
     Checks the BookMyShow URL for ticket availability using Playwright.
-    Uses ScraperAPI proxy if available to avoid blocks.
     """
     ua = UserAgent()
     user_agent = ua.random
 
-    # Configure Proxy if API Key is present in Env Vars
+    # Configure Proxy if API Key is present
     proxy_config = None
     if SCRAPER_API_KEY:
-        logger.info("🛡️ Using ScraperAPI Proxy for protection...")
+        logger.info("🛡️ Using ScraperAPI Proxy...")
         proxy_config = {
             "server": "http://proxy-server.scraperapi.com:8001",
             "username": "scraperapi",
@@ -71,7 +63,7 @@ async def check_ticket_availability():
             # Launch browser
             browser = await p.chromium.launch(
                 headless=True,
-                proxy=proxy_config,  # Use the proxy if configured
+                proxy=proxy_config,
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -80,42 +72,37 @@ async def check_ticket_availability():
                 ]
             )
 
-            # Create a new context with a realistic user agent and viewport
             context = await browser.new_context(
                 user_agent=user_agent,
                 viewport={'width': 1280, 'height': 800}
             )
 
-            # ScraperAPI specific: verify SSL=False often helps with proxies
             if SCRAPER_API_KEY:
-                context.set_default_timeout(60000)  # Give proxy more time
+                context.set_default_timeout(60000)
 
             page = await context.new_page()
-
             logger.info(f"🔎 Checking BMS for: {MOVIE_NAME}")
 
             # Go to the URL
             await page.goto(MOVIE_URL, timeout=90000, wait_until="domcontentloaded")
 
             # --- SCRAPING LOGIC ---
-            # Check for specific "Book" buttons or showtime availability
+            # Check for "Book" buttons, showtime pills, or the showtime container
             try:
-                # Look for the 'Book tickets' button or showtime pills
-                # We wait up to 15s because proxies can be slightly slower
                 found_showtimes = await page.wait_for_selector(
                     "a.showtime-pill, .showtime-pill, button:has-text('Book'), #showtimes",
                     timeout=15000
                 )
 
                 if found_showtimes:
-                    logger.info("🎉 TICKETS DETECTED! Found showtime elements.")
+                    logger.info("🎉 TICKETS DETECTED!")
                     screenshot_path = "success.png"
                     await page.screenshot(path=screenshot_path)
                     await browser.close()
                     return True, screenshot_path
 
             except Exception:
-                logger.info("ℹ️ No showtimes found (Selector timeout).")
+                logger.info("ℹ️ No showtimes found yet.")
 
             await browser.close()
             return False, None
@@ -126,13 +113,8 @@ async def check_ticket_availability():
 
 # --- BACKGROUND TASK ---
 async def monitor_task(app: Application):
-    """
-    Continuous loop that checks for tickets based on CHECK_INTERVAL.
-    """
-    logger.info(f"🟢 Monitor Task Started. Checking every {CHECK_INTERVAL} seconds.")
-
-    # Initial warm-up wait
-    await asyncio.sleep(10)
+    logger.info(f"🟢 Monitor Task Started. Interval: {CHECK_INTERVAL}s")
+    await asyncio.sleep(10) # Warmup
 
     while True:
         try:
@@ -145,25 +127,18 @@ async def monitor_task(app: Application):
                     f"🔗 <a href='{MOVIE_URL}'>Book Now on BookMyShow</a>"
                 )
 
-                # Alert the user if Chat ID is set
                 if TARGET_CHAT_ID:
-                    await app.bot.send_message(
-                        chat_id=TARGET_CHAT_ID,
-                        text=msg,
-                        parse_mode='HTML'
-                    )
-
+                    await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg, parse_mode='HTML')
                     if screenshot and os.path.exists(screenshot):
                         await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=open(screenshot, 'rb'))
                         os.remove(screenshot)
                 else:
-                    logger.warning("Tickets found, but TARGET_CHAT_ID is not set! Check Railway variables.")
-
-                # Sleep for 10 minutes if found to avoid spamming
+                    logger.warning("Tickets found, but TARGET_CHAT_ID is missing!")
+                
+                # Wait 10 mins before next check to avoid spam
                 await asyncio.sleep(600)
 
             else:
-                logger.info(f"❌ No tickets. Sleeping for {CHECK_INTERVAL}s...")
                 await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
@@ -174,50 +149,45 @@ async def monitor_task(app: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_html(
-        f"👋 Bot is Online!\n\n"
-        f"Monitoring: <b>{MOVIE_NAME}</b>\n"
-        f"Check Interval: <b>{CHECK_INTERVAL}s</b>\n"
-        f"Proxy Enabled: <b>{'Yes' if SCRAPER_API_KEY else 'No'}</b>\n\n"
-        f"🆔 Your Chat ID: <code>{chat_id}</code>\n"
-        f"<i>(Copy this ID and add it to Railway variables as TARGET_CHAT_ID if you haven't already!)</i>"
+        f"👋 <b>Bot Online!</b>\n"
+        f"Monitoring: {MOVIE_NAME}\n"
+        f"Your Chat ID: <code>{chat_id}</code>"
     )
 
 # --- MAIN SETUP ---
 def main():
     if not TOKEN:
-        logger.critical("❌ FATAL: BOT_TOKEN is missing! Add it to Railway Variables.")
+        logger.critical("❌ FATAL: BOT_TOKEN is missing!")
         return
 
-    # Advanced Network Configuration (Fixes Railway Timeouts & HTTP Version Error)
+    # [FIX] Set http_version HERE inside HTTPXRequest
+    # Do NOT use .get_updates_http_version() in the builder if using a custom request.
     request_config = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=60.0,
         read_timeout=60.0,
         write_timeout=60.0,
         pool_timeout=60.0,
-        http_version="1.1"  # [FIX] Set HTTP version HERE, not in the builder
+        http_version="1.1" 
     )
 
-    # Build Application
     application = (
         ApplicationBuilder()
         .token(TOKEN)
-        .request(request_config)  # Apply network fixes
+        .request(request_config) # This applies the fix
         .build()
     )
 
-    # Add Handlers
     application.add_handler(CommandHandler("start", start))
 
-    # Register Background Task
     async def post_init(app: Application):
         asyncio.create_task(monitor_task(app))
-
+    
     application.post_init = post_init
 
     logger.info("🚀 Bot is starting...")
 
-    # Infinite retry loop on startup (Fixes initialization crashes)
+    # bootstrap_retries=-1 prevents startup crashes
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
