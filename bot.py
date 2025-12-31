@@ -30,25 +30,46 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
 CHAT_ID = None
 
-def get_chat_id():
+def force_start_connection():
+    """
+    Loops until it finds a user's /start message and replies to it.
+    """
     global CHAT_ID
-    try:
-        r = requests.get(f"{TELEGRAM_API}/getUpdates", timeout=10).json()
-        if r.get("result"):
-            CHAT_ID = r["result"][-1]["message"]["chat"]["id"]
-            print("✅ Chat ID detected:", CHAT_ID)
-    except Exception as e:
-        print(f"⚠️ Could not detect Chat ID: {e}")
+    print("⏳ Waiting for user to send /start in Telegram...")
+    
+    while CHAT_ID is None:
+        try:
+            r = requests.get(f"{TELEGRAM_API}/getUpdates", timeout=10).json()
+            results = r.get("result", [])
+            
+            if results:
+                # Get the last message sent to the bot
+                last_msg = results[-1].get("message", {})
+                chat_id = last_msg.get("chat", {}).get("id")
+                
+                if chat_id:
+                    CHAT_ID = chat_id
+                    print(f"✅ Found User! Chat ID: {CHAT_ID}")
+                    
+                    # Send a welcome message to confirm it's working
+                    send_message(
+                        "🟢 **Jana Nayagan Monitor is ONLINE**\n\n"
+                        "I am now checking BookMyShow every 5 minutes.\n"
+                        "I will alert you when tickets open!"
+                    )
+                    return
+        except Exception as e:
+            print(f"⚠️ Connection Error: {e}")
+        
+        time.sleep(5)
 
 def send_message(text):
     if CHAT_ID is None:
-        get_chat_id()
-        if CHAT_ID is None:
-            return
+        return
     try:
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
+            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
     except Exception as e:
@@ -64,6 +85,7 @@ def fetch_data():
                 'premium': 'true',
                 'render': 'true', 
             }
+            # Extended timeout for render mode
             r = requests.get('http://api.scraperapi.com', params=payload, timeout=80)
             if r.status_code == 200: return r.text
             print(f"⚠️ Proxy Status: {r.status_code}")
@@ -91,23 +113,18 @@ def extract_hash(html):
         return None
 
     data_points = []
-
-    # 1. Theatre Names
     venues = soup.select('a.__venue-name')
     for venue in venues:
         data_points.append(venue.get_text(strip=True))
 
-    # 2. Hidden JSON Data
     script = soup.find("script", id="__NEXT_DATA__")
     if script:
         data_points.append(hashlib.md5(script.string.encode()).hexdigest())
 
-    # 🚨 LOGIC FIX V4:
-    # If title is correct but 0 venues found, it means "Coming Soon".
-    # We return a specific hash for this state.
+    # Logic: 0 venues + Correct Title = Coming Soon (Valid State)
     if not data_points:
         if "Jana Nayagan" in page_title:
-             print("ℹ️ Page Valid. Status: NO SHOWS YET (Waiting for update...)")
+             print("ℹ️ Page Valid. Status: NO SHOWS YET.")
              return hashlib.sha256(b"NO_SHOWS_YET").hexdigest()
         else:
              return None
@@ -127,7 +144,11 @@ def save_state(h):
         json.dump({"hash": h}, f)
 
 def monitor():
-    print("🟢 Monitor Started (v4 - FINAL FIXED)")
+    # 1. Establish Connection FIRST
+    force_start_connection()
+
+    # 2. Start Monitoring
+    print("🟢 Monitor Loop Started")
     last_hash = load_state()
 
     while True:
@@ -138,17 +159,17 @@ def monitor():
             
             if current_hash:
                 if last_hash and current_hash != last_hash:
-                    msg = f"🚨 *UPDATE DETECTED*\n\nStatus Changed on BookMyShow!\n(Likely shows added or removed)\n🔗 {MOVIE_URL}"
+                    msg = f"🚨 *UPDATE DETECTED*\n\nStatus Changed on BookMyShow!\n🔗 {MOVIE_URL}"
                     send_message(msg)
-                    print("✅ Change detected!")
+                    print("✅ Change detected! Message sent.")
                 elif not last_hash:
-                    print("ℹ️ Baseline set (First Run).")
+                    print("ℹ️ Baseline set.")
                 else:
                     print("💤 No changes.")
                 save_state(current_hash)
                 last_hash = current_hash
             else:
-                print("⚠️ Retrying... (Page load issue)")
+                print("⚠️ HTML loaded, but logic skipped update (Check DEBUG Title).")
         
         time.sleep(CHECK_INTERVAL)
 
