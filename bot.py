@@ -4,44 +4,75 @@ import json
 import hashlib
 import requests
 
-# ================= SAFE ENV READ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MOVIE_URL = os.getenv("MOVIE_URL")
+MOVIE_CODE = os.getenv("MOVIE_CODE")
+CITY = os.getenv("CITY", "bengaluru")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
 print("🔍 ENV CHECK")
 print("BOT_TOKEN:", "SET" if BOT_TOKEN else "MISSING")
-print("MOVIE_URL:", MOVIE_URL or "MISSING")
+print("MOVIE_CODE:", MOVIE_CODE)
+print("CITY:", CITY)
 print("CHECK_INTERVAL:", CHECK_INTERVAL)
 
-if not BOT_TOKEN or not MOVIE_URL:
-    print("⚠️ Env vars missing. Bot will NOT crash. Waiting...")
+if not BOT_TOKEN or not MOVIE_CODE:
+    print("❌ Missing env vars. Waiting...")
     while True:
         time.sleep(60)
 
-# ================= CONFIG =================
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-CHAT_ID = None  # will auto-detect first chat
-# ==========================================
+CHAT_ID = None
+
+API_URL = (
+    f"https://in.bookmyshow.com/api/explore/v1/movies/"
+    f"{MOVIE_CODE}/showtimes?region={CITY}"
+)
+
+HEADERS = {
+    "User-Agent": "BookMyShow-App",
+    "Accept": "application/json"
+}
 
 
-def fetch_html():
-    r = requests.get(MOVIE_URL, headers=HEADERS, timeout=20)
+def get_chat_id():
+    global CHAT_ID
+    r = requests.get(f"{TELEGRAM_API}/getUpdates", timeout=10).json()
+    if r.get("result"):
+        CHAT_ID = r["result"][-1]["message"]["chat"]["id"]
+        print("✅ Chat ID detected:", CHAT_ID)
+
+
+def send_message(text):
+    if CHAT_ID is None:
+        get_chat_id()
+        if CHAT_ID is None:
+            print("⏳ Waiting for /start in Telegram…")
+            return
+
+    requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text},
+        timeout=10
+    )
+
+
+def fetch_show_data():
+    r = requests.get(API_URL, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    return r.text
+    return r.json()
 
 
-def fingerprint(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def fingerprint(data):
+    raw = json.dumps(data, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return None
-    with open(STATE_FILE, "r") as f:
-        return json.load(f).get("fp")
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f).get("fp")
+    return None
 
 
 def save_state(fp):
@@ -49,44 +80,20 @@ def save_state(fp):
         json.dump({"fp": fp}, f)
 
 
-def send_message(text):
-    global CHAT_ID
-
-    # Auto-discover chat id
-    if CHAT_ID is None:
-        updates = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            timeout=10
-        ).json()
-
-        if not updates.get("result"):
-            print("⏳ Waiting for /start message in Telegram…")
-            return
-
-        CHAT_ID = updates["result"][-1]["message"]["chat"]["id"]
-        print("✅ Chat ID detected:", CHAT_ID)
-
-    requests.post(
-        TELEGRAM_API,
-        data={"chat_id": CHAT_ID, "text": text},
-        timeout=10
-    )
-
-
 def monitor():
-    print("🟢 Jana Nayagan monitor started")
+    print("🟢 Jana Nayagan API monitor started")
     prev_fp = load_state()
 
     while True:
         try:
-            html = fetch_html()
-            cur_fp = fingerprint(html)
+            data = fetch_show_data()
+            cur_fp = fingerprint(data)
 
             if prev_fp and cur_fp != prev_fp:
                 send_message(
-                    "🚨 JANA NAYAGAN UPDATE DETECTED\n\n"
-                    "🎭 New theatre or show added!\n"
-                    "🎟️ Book now on BookMyShow"
+                    "🚨 JANA NAYAGAN UPDATE!\n\n"
+                    "🎭 New theatre or showtime detected.\n"
+                    "🎟️ Check BookMyShow now!"
                 )
                 print("✅ Change detected → Notification sent")
 
