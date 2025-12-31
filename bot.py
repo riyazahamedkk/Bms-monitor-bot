@@ -11,17 +11,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MOVIE_URL = os.getenv("MOVIE_URL")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 
-# 🚨 Safe Load for Interval (Prevents crashes if set incorrectly)
 try:
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 except ValueError:
-    print("⚠️ Invalid CHECK_INTERVAL format. Defaulting to 300s.")
     CHECK_INTERVAL = 300
 
 print("🔍 ENV CHECK")
 print("BOT_TOKEN:", "SET" if BOT_TOKEN else "MISSING")
 print("MOVIE_URL:", MOVIE_URL)
-print(f"MODE: {'PROXY (ScraperAPI)' if SCRAPER_API_KEY else 'DIRECT (Safari Impersonation)'}")
+print(f"MODE: {'PROXY (ScraperAPI)' if SCRAPER_API_KEY else 'DIRECT'}")
 
 if not BOT_TOKEN or not MOVIE_URL:
     print("❌ Critical Missing: BOT_TOKEN or MOVIE_URL.")
@@ -31,8 +29,6 @@ if not BOT_TOKEN or not MOVIE_URL:
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
 CHAT_ID = None
-
-# ================= FUNCTIONS =================
 
 def get_chat_id():
     global CHAT_ID
@@ -59,35 +55,36 @@ def send_message(text):
         print(f"❌ Failed to send message: {e}")
 
 def fetch_data():
-    """
-    Fetches page using Proxy (if key exists) or Direct Impersonation.
-    """
-    # OPTION A: PROXY MODE (Best for Cloud)
+    # OPTION A: PROXY MODE (ScraperAPI)
     if SCRAPER_API_KEY:
         try:
             payload = {
                 'api_key': SCRAPER_API_KEY,
                 'url': MOVIE_URL,
-                'keep_headers': 'true',
                 'country_code': 'in',
-                'premium': 'true',  # 🚨 Added to bypass tough blocks
+                'premium': 'true',  # Use High-Quality Residential IPs
+                'render': 'true',   # 🚨 FORCE BROWSER RENDERING (Fixes blank pages)
             }
-            r = requests.get('http://api.scraperapi.com', params=payload, timeout=60)
-            if r.status_code == 200: return r.text
+            # Increased timeout to 80s because 'render=true' is slower but safer
+            r = requests.get('http://api.scraperapi.com', params=payload, timeout=80)
+            
+            if r.status_code == 200: 
+                return r.text
+            
             print(f"⚠️ Proxy Status: {r.status_code}")
+            # If 403/500, print a snippet to see what happened
+            if r.status_code in [403, 500]:
+                print(f"⚠️ Error Content: {r.text[:200]}")
+
         except Exception as e:
             print(f"⚠️ Proxy Error: {e}")
 
-    # OPTION B: DIRECT MODE (Best for Local PC)
+    # OPTION B: DIRECT MODE
     else:
         try:
-            r = curl_requests.get(
-                MOVIE_URL,
-                impersonate="safari15_5",
-                timeout=20
-            )
+            r = curl_requests.get(MOVIE_URL, impersonate="safari15_5", timeout=20)
             if r.status_code == 200: return r.text
-            if r.status_code == 403: print("⚠️ Direct Mode 403 (Blocked).")
+            print(f"⚠️ Direct Status: {r.status_code}")
         except Exception as e:
             print(f"⚠️ Direct Fetch Error: {e}")
             
@@ -97,33 +94,30 @@ def extract_hash(html):
     if not html: return None
     soup = BeautifulSoup(html, "html.parser")
     
-    # 🔍 DEBUG: Print title to know if we are blocked
+    # 🔍 DEBUG: Print title to confirm we are running NEW code
     page_title = soup.title.string.strip() if soup.title else "No Title"
-    print(f"📄 Page Title: {page_title}")
+    print(f"📄 DEBUG: Page Title is '{page_title}'")
 
-    if "Access Denied" in page_title or "Just a moment" in page_title:
-        print("⚠️ BLOCKED: Cloudflare Captcha detected.")
+    if "Just a moment" in page_title or "Access Denied" in page_title:
+        print("⚠️ BLOCKED: Cloudflare is stopping us.")
         return None
 
     data_points = []
 
-    # 1. Theatre Names (Visible Links)
+    # 1. Theatre Names
     venues = soup.select('a.__venue-name')
     for venue in venues:
         data_points.append(venue.get_text(strip=True))
 
-    # 2. Hidden JSON Data (React/NextJS)
+    # 2. Hidden JSON Data
     script = soup.find("script", id="__NEXT_DATA__")
     if script:
         data_points.append(hashlib.md5(script.string.encode()).hexdigest())
 
-    # If we found NOTHING, the page might be empty or layout changed
     if not data_points:
         return None
 
-    print(f"📊 Data Found: {len(venues)} theatres + JSON data.")
-    
-    # Create unique hash
+    print(f"📊 Success! Found {len(venues)} theatres.")
     raw = json.dumps(sorted(data_points))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -138,7 +132,7 @@ def save_state(h):
         json.dump({"hash": h}, f)
 
 def monitor():
-    print("🟢 Monitor Started")
+    print("🟢 Monitor Started (v3 - Ultra Stealth)")
     last_hash = load_state()
 
     while True:
@@ -149,23 +143,17 @@ def monitor():
             
             if current_hash:
                 if last_hash and current_hash != last_hash:
-                    msg = (
-                        "🚨 *JANA NAYAGAN UPDATE*\n\n"
-                        "Changes detected on BookMyShow!\n"
-                        f"🔗 {MOVIE_URL}"
-                    )
+                    msg = f"🚨 *UPDATE DETECTED*\n\nChanges on BookMyShow!\n🔗 {MOVIE_URL}"
                     send_message(msg)
-                    print("✅ Change detected → Alert sent!")
-                
+                    print("✅ Change detected!")
                 elif not last_hash:
-                    print(f"ℹ️ First run. Baseline set. (Hash: {current_hash[:10]}...)")
+                    print("ℹ️ Baseline set.")
                 else:
                     print("💤 No changes.")
-
                 save_state(current_hash)
                 last_hash = current_hash
             else:
-                print("⚠️ Page loaded, but no movie data found (Sold out or Blocked).")
+                print("⚠️ HTML loaded, but data extraction failed (Check Page Title above).")
         
         time.sleep(CHECK_INTERVAL)
 
