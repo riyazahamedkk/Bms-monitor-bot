@@ -102,13 +102,12 @@ def extract_hash(html):
     if script:
         data_points.append(hashlib.md5(script.string.encode()).hexdigest())
 
-    # 🚨 LOGIC FIX:
-    # If the title is correct but 0 venues found, it means "Coming Soon".
-    # We return a valid hash for "Empty State" so that when it changes, we get alerted.
+    # 🚨 LOGIC FIX V4:
+    # If title is correct but 0 venues found, it means "Coming Soon".
+    # We return a specific hash for this state.
     if not data_points:
         if "Jana Nayagan" in page_title:
-             print("ℹ️ Page is valid, but NO SHOWS found yet (Coming Soon).")
-             # We create a fake hash for '0 shows' so the bot has a baseline
+             print("ℹ️ Page Valid. Status: NO SHOWS YET (Waiting for update...)")
              return hashlib.sha256(b"NO_SHOWS_YET").hexdigest()
         else:
              return None
@@ -128,7 +127,7 @@ def save_state(h):
         json.dump({"hash": h}, f)
 
 def monitor():
-    print("🟢 Monitor Started (Fixed Logic)")
+    print("🟢 Monitor Started (v4 - FINAL FIXED)")
     last_hash = load_state()
 
     while True:
