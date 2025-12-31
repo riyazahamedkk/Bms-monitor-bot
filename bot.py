@@ -5,10 +5,26 @@ import json
 import os
 import sys
 import random
+import subprocess
 import warnings
 from datetime import datetime
 
-# Third-party imports
+# ================= SELF-REPAIR: INSTALL BROWSER =================
+# This forces Railway to install the browser if it's missing
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    print("📦 Installing Playwright...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "playwright"])
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+
+# Check if browser binary exists, if not, install it
+if not os.path.exists("/root/.cache/ms-playwright"):
+    print("🛠️ Browser binary missing. Installing Chromium now... (This takes 1 min)")
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+    subprocess.run([sys.executable, "-m", "playwright", "install-deps"])
+
+# ================= IMPORTS =================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error as telegram_error
 from telegram.ext import (
     Application,
@@ -20,20 +36,16 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from fake_useragent import UserAgent
 
-# 🟢 FIX: Silence the annoying PTBUserWarning
+# Silence Warnings
 from telegram.warnings import PTBUserWarning
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ================= CONFIGURATION =================
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
-
-# Railway Settings
 HEADLESS_MODE = True
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180")) 
-USER_DATA_DIR = "./browser_data" 
 
 if os.path.exists("/app/data"):
     DB_FILE = "/app/data/monitor.db"
@@ -50,7 +62,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= DATABASE MANAGER =================
+# ================= DATABASE =================
 class Database:
     def __init__(self, db_file):
         self.db_file = db_file
@@ -148,31 +160,29 @@ class BrowserManager:
                 logger.info(f"🔎 Searching: {query}")
                 await page.goto("https://in.bookmyshow.com/explore/home/", timeout=60000)
                 
-                # Try multiple ways to find search
-                search_found = False
-                selectors = ["input[type='text']", "span#4", "span:has-text('Search')"]
-                for s in selectors:
-                    try:
-                        if await page.locator(s).first.is_visible(timeout=2000):
-                            await page.locator(s).first.click()
-                            search_found = True
-                            break
-                    except: continue
+                # Robust Search Clicker
+                try:
+                    search_box = page.locator("span:has-text('Search'), input[type='text'], #4").first
+                    if await search_box.is_visible():
+                        await search_box.click()
+                except: pass
                 
                 await page.locator("input").fill(query)
-                await asyncio.sleep(6) # Increased wait for cloud lag
+                await asyncio.sleep(4) # Wait for AJAX
 
                 await page.wait_for_selector("a[href*='/movies/']", timeout=15000)
                 links = await page.locator("a[href*='/movies/']").all()
 
                 results = []
-                for link in links[:5]:
+                seen_urls = set()
+                for link in links[:6]:
                     url = await link.get_attribute("href")
                     title = await link.inner_text()
-                    if title and url:
+                    if title and url and url not in seen_urls:
                         if "bookmyshow.com" not in url:
                             url = "https://in.bookmyshow.com" + url
                         results.append({"title": title.strip(), "url": url})
+                        seen_urls.add(url)
                 
                 await browser.close()
                 return results
@@ -190,19 +200,35 @@ class BrowserManager:
                 context = await browser.new_context(user_agent=self.ua.random, locale="en-IN")
                 page = await context.new_page()
                 
-                logger.info(f"🌍 Fetching: {url}")
-                response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                logger.info(f"🌍 Fetching: {url} | City: {city}")
                 
-                if response.status == 403:
-                    raise Exception("403 Forbidden")
+                # 1. Navigate to Generic Movie URL
+                response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                if response.status == 403: raise Exception("403 Forbidden")
 
+                # 2. Handle City Selection Popup / Change Region
                 try:
-                    if await page.get_by_placeholder("Search for your city").is_visible(timeout=5000):
-                        await page.get_by_placeholder("Search for your city").fill(city)
+                    # If popup exists, type city and click
+                    city_input = page.get_by_placeholder("Search for your city")
+                    if await city_input.is_visible(timeout=5000):
+                        await city_input.fill(city)
+                        await asyncio.sleep(1)
                         await page.get_by_text(city, exact=False).first.click()
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(5) # Wait for page reload/redirect
                 except: pass
 
+                # 3. If no shows, check if we need to click "Book Tickets" to see venue list
+                try:
+                    book_btn = page.get_by_role("button", name="Book tickets")
+                    if await book_btn.is_visible(timeout=3000):
+                        await book_btn.click()
+                        await asyncio.sleep(3)
+                        # Handle Format selection (2D/3D/IMAX) if it pops up
+                        if await page.locator("ul#filterFormat").is_visible():
+                            await page.locator("li").first.click()
+                except: pass
+
+                # 4. Scrape Data
                 await asyncio.sleep(3)
                 if not await page.get_by_text("No shows available").is_visible():
                     venue_elements = await page.locator("li.list-group-item").all()
@@ -221,55 +247,126 @@ class BrowserManager:
 
 browser_manager = BrowserManager()
 
-# ================= HANDLERS =================
-SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE, MANUAL_URL = range(5)
+# ================= CONVERSATION HANDLERS =================
+SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE, SEARCH_MANUAL = range(5)
+
+# 🟢 CUSTOM LIST: Add trending movies here to show as buttons
+TRENDING_MOVIES = ["Jana Nayagan", "Viduthalai Part 2", "Interstellar", "Mufasa"]
+MAJOR_CITIES = ["Bengaluru", "Chennai", "Mumbai", "Hyderabad", "Kochi", "Delhi"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_user(update.effective_user.id, update.effective_chat.id)
-    await update.message.reply_text("👋 Bot is Online! Use /setup to start.")
+    await update.message.reply_text("👋 Bot Online!\n\nUse /setup to start monitoring.")
 
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎬 Enter Movie Name:")
+    # 🟢 NEW: Show Trending Buttons + Search Option
+    keyboard = [[InlineKeyboardButton(m, callback_data=f"trend_{m}")] for m in TRENDING_MOVIES]
+    keyboard.append([InlineKeyboardButton("🔍 Search Another Movie", callback_data="search_manual")])
+    
+    await update.message.reply_text(
+        "🎬 **Select a Movie** or search manually:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
     return SEARCH
 
-async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔎 Searching... (Waiting 10s for results)")
-    results = await browser_manager.search_movie(update.message.text)
+async def search_decision_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "search_manual":
+        await query.edit_message_text("🔍 **Type the movie name:**")
+        return SEARCH_MANUAL
     
-    # 🟢 FIX: If search fails, ask for URL directly
+    # User clicked a Trending Movie Button
+    movie_name = data.split("_")[1]
+    await query.edit_message_text(f"🔎 Auto-detecting link for: **{movie_name}**...")
+    
+    # Auto-search the link
+    results = await browser_manager.search_movie(movie_name)
     if not results:
-        await msg.edit_text("❌ No movies found via search.\n\n🔗 **Please paste the full BookMyShow movie link:**")
-        return MANUAL_URL
+        await query.message.reply_text("❌ Could not auto-detect link. Please type the name manually:")
+        return SEARCH_MANUAL
+
+    # Auto-select the first result for trending movies
+    context.user_data["movie"] = results[0]
     
-    keyboard = [[InlineKeyboardButton(r['title'], callback_data=f"m_{i}")] for i, r in enumerate(results)]
+    # Move to City Selection
+    return await send_city_selection(update, context)
+
+async def manual_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = update.message.text
+    msg = await update.message.reply_text("🔎 Searching BookMyShow...")
+    
+    results = await browser_manager.search_movie(query_text)
+    if not results:
+        await msg.edit_text("❌ No movies found. Try exact name:")
+        return SEARCH_MANUAL
+    
     context.user_data["results"] = results
-    await msg.edit_text("Select Movie:", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [[InlineKeyboardButton(r['title'], callback_data=f"mov_{i}")] for i, r in enumerate(results)]
+    await msg.edit_text("✅ **Select Correct Movie:**", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECT_MOVIE
 
-# 🟢 NEW: Handles Manual Link Parsing
-async def manual_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if "bookmyshow.com" not in url:
-        await update.message.reply_text("❌ Invalid Link. Please paste a valid BookMyShow URL:")
-        return MANUAL_URL
-    
-    # Fake a movie object
-    context.user_data["movie"] = {"title": "Manual Selection", "url": url}
-    await update.message.reply_text(f"✅ Link Accepted!\n\n📍 Enter City (e.g., Chennai):")
-    return SELECT_CITY
-
-async def movie_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     idx = int(query.data.split("_")[1])
     context.user_data["movie"] = context.user_data["results"][idx]
-    await query.edit_message_text(f"Selected: {context.user_data['movie']['title']}\n\n📍 Enter City (e.g., Chennai):")
+    return await send_city_selection(update, context)
+
+async def send_city_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 🟢 NEW: Show City Buttons
+    keyboard = []
+    # Create 2 columns of cities
+    row = []
+    for city in MAJOR_CITIES:
+        row.append(InlineKeyboardButton(city, callback_data=f"city_{city}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row: keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("✍️ Type Other City", callback_data="city_manual")])
+    
+    text = f"✅ Selected: **{context.user_data['movie']['title']}**\n\n📍 **Select City:**"
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
     return SELECT_CITY
 
-async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["city"] = update.message.text
+async def city_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    if data == "city_manual":
+        await query.edit_message_text("✍️ **Please type your city name:**")
+        return SELECT_CITY # Wait for text input
+    
+    # User clicked a City Button
+    city = data.split("_")[1]
+    context.user_data["city"] = city
+    return await send_notify_mode(update, context)
+
+async def city_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["city"] = update.message.text.strip()
+    return await send_notify_mode(update, context)
+
+async def send_notify_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btns = [[InlineKeyboardButton("Theatres", callback_data="THEATRE"), InlineKeyboardButton("Shows", callback_data="SHOW"), InlineKeyboardButton("Both", callback_data="BOTH")]]
-    await update.message.reply_text("🔔 Notify on:", reply_markup=InlineKeyboardMarkup(btns))
+    
+    text = f"📍 City: **{context.user_data['city']}**\n\n🔔 **Notify me on:**"
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+    
     return SELECT_MODE
 
 async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,23 +374,37 @@ async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = query.from_user
     data = context.user_data
-    db.update_user(user.id, query.message.chat_id, movie_name=data["movie"]["title"], movie_url=data["movie"]["url"], city=data["city"], notify_mode=query.data)
+    
+    db.update_user(
+        user.id, query.message.chat_id, 
+        movie_name=data["movie"]["title"], 
+        movie_url=data["movie"]["url"], 
+        city=data["city"], 
+        notify_mode=query.data
+    )
     db.save_snapshot(user.id, {})
-    await query.edit_message_text("✅ Setup Complete! I will check every 3 minutes.")
+    
+    await query.edit_message_text(
+        f"✅ **Setup Complete!**\n\n"
+        f"🎥 {data['movie']['title']}\n"
+        f"📍 {data['city']}\n"
+        f"🔗 Auto-Link: {data['movie']['url']}\n\n"
+        "I will now monitor this movie in this city automatically."
+    )
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Cancelled.")
     return ConversationHandler.END
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db.get_active_users()
     active = next((u for u in users if u['user_id'] == update.effective_user.id), None)
-    await update.message.reply_text(f"🟢 Monitoring: {active['movie_name']}" if active else "🔴 Not monitoring.")
+    await update.message.reply_text(f"🟢 Monitoring: {active['movie_name']} in {active['city']}" if active else "🔴 Not monitoring.")
 
 async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.stop_monitoring(update.effective_user.id)
     await update.message.reply_text("🛑 Stopped.")
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 Cancelled.")
-    return ConversationHandler.END
 
 # ================= BACKGROUND TASK =================
 async def monitor_task(app: Application):
@@ -304,7 +415,6 @@ async def monitor_task(app: Application):
             if users:
                 for user in users:
                     await asyncio.sleep(10) 
-                    logger.info(f"Checking {user['movie_name']} for {user['user_id']}")
                     curr, err = await browser_manager.fetch_movie_data(user['movie_url'], user['city'])
                     
                     if not err:
@@ -313,7 +423,7 @@ async def monitor_task(app: Application):
                         
                         msg = ""
                         if user['notify_mode'] in ['THEATRE', 'BOTH'] and new_theatres:
-                            msg = f"🚨 **New Theatres:**\n" + "\n".join(new_theatres)
+                            msg = f"🚨 **New Theatres in {user['city']}:**\n" + "\n".join(new_theatres)
                         
                         if msg:
                             await app.bot.send_message(user['chat_id'], msg)
@@ -343,10 +453,13 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("setup", setup_start)],
         states={
-            SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler)],
-            MANUAL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_url_handler)],
-            SELECT_MOVIE: [CallbackQueryHandler(movie_select_handler)],
-            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
+            SEARCH: [CallbackQueryHandler(search_decision_handler)],
+            SEARCH_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_search_handler)],
+            SELECT_MOVIE: [CallbackQueryHandler(movie_selection_handler)],
+            SELECT_CITY: [
+                CallbackQueryHandler(city_button_handler, pattern="^city_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, city_text_handler)
+            ],
             SELECT_MODE: [CallbackQueryHandler(mode_handler)]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -358,7 +471,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
 
-    print("🚀 Bot Started (Clean Logs + Link Support)")
+    print("🚀 Bot Started (Smart Setup + Auto Repair)")
     
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
