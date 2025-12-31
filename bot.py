@@ -1,13 +1,14 @@
 import os
-import time
-import json
-import threading
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ================== ENV ==================
+# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MOVIE_CODE = os.getenv("MOVIE_CODE")
 CITY = os.getenv("CITY", "bengaluru")
@@ -16,96 +17,85 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 if not BOT_TOKEN or not MOVIE_CODE:
     raise RuntimeError("Missing BOT_TOKEN or MOVIE_CODE")
 
-# ================== GLOBALS ==================
 BASE_URL = f"https://in.bookmyshow.com/movies/{CITY}/jana-nayagan/buytickets/{MOVIE_CODE}"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
-last_fingerprint = set()
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+last_snapshot = set()
 subscribers = set()
 
-# ================== HELPERS ==================
-def fetch_shows():
-    """Scrape BookMyShow and return a set fingerprint"""
+# ================= SCRAPER =================
+def scrape_shows():
     try:
-        res = requests.get(BASE_URL, headers=HEADERS, timeout=15)
-        if res.status_code != 200:
+        r = requests.get(BASE_URL, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
             return set()
 
-        soup = BeautifulSoup(res.text, "html.parser")
-        fingerprint = set()
+        soup = BeautifulSoup(r.text, "html.parser")
+        result = set()
 
-        theatres = soup.select('[data-testid="theatre-card"]')
-        for theatre in theatres:
-            name_el = theatre.select_one("h3, h4")
-            if not name_el:
+        for theatre in soup.select('[data-testid="theatre-card"]'):
+            name = theatre.select_one("h3, h4")
+            if not name:
                 continue
 
-            theatre_name = name_el.get_text(strip=True)
+            theatre_name = name.get_text(strip=True)
 
-            shows = theatre.select("a[href*='/buytickets/']")
-            for show in shows:
-                show_time = show.get_text(strip=True)
-                link = show.get("href").split("?")[0]
-                fingerprint.add(f"{theatre_name} | {show_time} | {link}")
+            for show in theatre.select("a[href*='/buytickets/']"):
+                time_txt = show.get_text(strip=True)
+                link = show.get("href", "").split("?")[0]
+                result.add(f"{theatre_name} | {time_txt} | {link}")
 
-        return fingerprint
+        return result
     except Exception as e:
         print("SCRAPE ERROR:", e)
         return set()
 
-# ================== MONITOR LOOP ==================
-def monitor_loop(app):
-    global last_fingerprint
-    print("🟢 Monitor started")
+# ================= MONITOR =================
+async def monitor(context: ContextTypes.DEFAULT_TYPE):
+    global last_snapshot
 
-    while True:
-        current = fetch_shows()
+    current = scrape_shows()
+    if not current:
+        return
 
-        if current and last_fingerprint:
-            new_items = current - last_fingerprint
+    if last_snapshot:
+        diff = current - last_snapshot
+        if diff:
+            theatres = {x.split("|")[0].strip() for x in diff}
+            msg = (
+                "🎬 *Jana Nayagan – New Shows Added!*\n\n"
+                f"🎭 Theatres: {len(theatres)}\n"
+                f"🎟 Shows: {len(diff)}\n\n"
+                f"🔗 {BASE_URL}"
+            )
 
-            if new_items:
-                theatres = {i.split("|")[0].strip() for i in new_items}
-                message = (
-                    "🎬 *Jana Nayagan – New Shows Added!*\n\n"
-                    f"🎭 Theatres: {len(theatres)}\n"
-                    f"🎟 Shows: {len(new_items)}\n\n"
-                    f"🔗 {BASE_URL}"
-                )
+            for chat_id in subscribers:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=msg,
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    print("SEND ERROR:", e)
 
-                for chat_id in subscribers:
-                    try:
-                        app.bot.send_message(
-                            chat_id=chat_id,
-                            text=message,
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        print("SEND ERROR:", e)
+    last_snapshot = current
 
-        last_fingerprint = current
-        time.sleep(CHECK_INTERVAL)
-
-# ================== COMMANDS ==================
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    subscribers.add(chat_id)
+    subscribers.add(update.effective_chat.id)
     await update.message.reply_text(
-        "🟢 Jana Nayagan Monitor Activated\n\n"
-        "You will receive alerts when NEW theatres or shows are added.\n"
-        f"⏱ Checking every {CHECK_INTERVAL} seconds."
+        "🟢 Jana Nayagan Monitor ON\n\n"
+        f"⏱ Checking every {CHECK_INTERVAL} seconds.\n"
+        "You’ll be alerted when NEW shows or theatres appear."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🟢 Bot is running\n"
-        f"City: {CITY}\n"
-        f"Movie Code: {MOVIE_CODE}\n"
-        f"Interval: {CHECK_INTERVAL}s"
+        f"🟢 Running\nCity: {CITY}\nInterval: {CHECK_INTERVAL}s"
     )
 
-# ================== MAIN ==================
+# ================= MAIN =================
 def main():
     print("🟢 Telegram BookMyShow bot started")
 
@@ -114,9 +104,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
 
-    # Background monitor thread
-    thread = threading.Thread(target=monitor_loop, args=(app,), daemon=True)
-    thread.start()
+    app.job_queue.run_repeating(monitor, interval=CHECK_INTERVAL, first=10)
 
     app.run_polling()
 
