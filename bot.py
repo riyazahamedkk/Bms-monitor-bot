@@ -1,229 +1,372 @@
 import asyncio
 import logging
+import sqlite3
+import json
 import os
 import sys
-import subprocess
 import random
+import warnings
+from datetime import datetime
 
-# Telegram Imports
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Application
+# Third-party imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error as telegram_error
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
-
-# Playwright Imports
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from fake_useragent import UserAgent
 
-# Try importing stealth, but don't crash if missing
-try:
-    from playwright_stealth import stealth_async
-    STEALTH_AVAILABLE = True
-except ImportError:
-    STEALTH_AVAILABLE = False
+# 🟢 FIX: Silence the annoying PTBUserWarning
+from telegram.warnings import PTBUserWarning
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-# --- CONFIGURATION ---
-TOKEN = os.getenv("BOT_TOKEN")
-# If you didn't set variables, use these fallbacks (replace with your own if needed)
-if not TOKEN:
-    TOKEN = "8405700631:AAHQFlEBRcdqzL6d8ek_0pfBOVuwiVYYYlg"
+# ================= CONFIGURATION =================
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
 
-MOVIE_URL = os.getenv("MOVIE_URL", "https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY") # Optional
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
-MOVIE_NAME = "Jana Nayagan"
+# Railway Settings
+HEADLESS_MODE = True
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180")) 
+USER_DATA_DIR = "./browser_data" 
 
-# --- LOGGING ---
+if os.path.exists("/app/data"):
+    DB_FILE = "/app/data/monitor.db"
+else:
+    DB_FILE = "monitor.db"
+
+# ================= LOGGING =================
+sys.stdout.reconfigure(encoding='utf-8')
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s", 
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
 )
-# Silence noisy logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- [CRITICAL FIX] AUTO-INSTALLER ---
-def install_browser():
-    """
-    Checks and installs the Chromium browser automatically.
-    This FIXES the 'Executable doesn't exist' error.
-    """
-    logger.info("⬇️ System Check: Verifying Browser...")
-    try:
-        # This command installs the chromium binary required by Playwright
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"], 
-            check=True
-        )
-        logger.info("✅ Browser installed successfully.")
-    except Exception as e:
-        logger.error(f"⚠️ Browser installation warning: {e}")
-        # We continue anyway, as it might already be installed in a different path
+# ================= DATABASE MANAGER =================
+class Database:
+    def __init__(self, db_file):
+        self.db_file = db_file
+        if "/" in db_file:
+            os.makedirs(os.path.dirname(db_file), exist_ok=True)
 
-# --- BROWSER LOGIC ---
-async def check_ticket_availability():
-    ua = UserAgent()
-    user_agent = ua.random
-
-    # Proxy Config
-    proxy_config = None
-    if SCRAPER_API_KEY:
-        logger.info("🛡️ Using ScraperAPI Proxy...")
-        proxy_config = {
-            "server": "http://proxy-server.scraperapi.com:8001",
-            "username": "scraperapi",
-            "password": SCRAPER_API_KEY
-        }
-
-    async with async_playwright() as p:
-        try:
-            # Launch Browser
-            # We explicitly use chromium which is lighter and faster
-            browser = await p.chromium.launch(
-                headless=True,
-                proxy=proxy_config,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--window-size=1920,1080'
-                ]
-            )
-
-            context = await browser.new_context(
-                user_agent=user_agent,
-                viewport={'width': 1920, 'height': 1080}
-            )
-
-            if SCRAPER_API_KEY:
-                context.set_default_timeout(60000)
-
-            page = await context.new_page()
-            
-            # Apply Stealth if installed
-            if STEALTH_AVAILABLE:
-                await stealth_async(page)
-
-            logger.info(f"🔎 Checking BMS for: {MOVIE_NAME}")
-
-            try:
-                await page.goto(MOVIE_URL, timeout=90000, wait_until="domcontentloaded")
-            except Exception:
-                logger.warning("⚠️ Page load timeout, checking selectors anyway...")
-
-            # --- SELECTOR LOGIC ---
-            # We look for POSITIVE signs (Booking buttons)
-            try:
-                found_element = await page.wait_for_selector(
-                    "a.showtime-pill, .showtime-pill-container, button:has-text('Book'), a[href*='buytickets']",
-                    state="visible", 
-                    timeout=20000
+    def init_db(self):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    chat_id INTEGER,
+                    movie_name TEXT,
+                    movie_url TEXT,
+                    city TEXT,
+                    notify_mode TEXT,
+                    is_active INTEGER DEFAULT 1
                 )
-
-                if found_element:
-                    # Double check for "Sold Out" text
-                    is_sold_out = await page.query_selector("text=Sold Out")
-                    if not is_sold_out:
-                        logger.info("🎉 TICKETS DETECTED!")
-                        screenshot_path = "success.png"
-                        await page.screenshot(path=screenshot_path)
-                        await browser.close()
-                        return True, screenshot_path
-
-            except Exception:
-                logger.info("ℹ️ No showtimes found.")
-
-            await browser.close()
-            return False, None
-
-        except Exception as e:
-            logger.error(f"⚠️ Browser Error: {e}")
-            return False, None
-
-# --- BOT TASK ---
-async def monitor_task(app: Application):
-    logger.info(f"🟢 Monitor Task Started. Checking every {CHECK_INTERVAL}s")
-    await asyncio.sleep(10)
-
-    while True:
-        try:
-            tickets_found, screenshot = await check_ticket_availability()
-
-            if tickets_found:
-                msg = (
-                    f"🚨 <b>TICKETS AVAILABLE!</b> 🚨\n\n"
-                    f"🎬 <b>Movie:</b> {MOVIE_NAME}\n"
-                    f"🔗 <a href='{MOVIE_URL}'>Book Now</a>"
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    user_id INTEGER PRIMARY KEY,
+                    data_json TEXT,
+                    last_updated TIMESTAMP
                 )
+            """)
+            conn.commit()
+
+    def get_active_users(self):
+        with sqlite3.connect(self.db_file) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE is_active = 1 AND movie_url IS NOT NULL")
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_user(self, user_id, chat_id, **kwargs):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone()
+            if not exists:
+                cursor.execute("INSERT INTO users (user_id, chat_id) VALUES (?, ?)", (user_id, chat_id))
+            if kwargs:
+                set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+                values = list(kwargs.values()) + [user_id]
+                cursor.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", values)
+            conn.commit()
+
+    def get_snapshot(self, user_id):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data_json FROM snapshots WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return json.loads(row[0]) if row and row[0] else {}
+
+    def save_snapshot(self, user_id, data):
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO snapshots (user_id, data_json, last_updated) VALUES (?, ?, ?)",
+                (user_id, json.dumps(data), datetime.now())
+            )
+            conn.commit()
+
+    def stop_monitoring(self, user_id):
+        with sqlite3.connect(self.db_file) as conn:
+            conn.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+db = Database(DB_FILE)
+
+# ================= BROWSER MANAGER =================
+class BrowserManager:
+    def __init__(self):
+        self.ua = UserAgent()
+
+    def get_stealth_args(self):
+        return [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-sandbox",
+            "--disable-dev-shm-usage", 
+            "--disable-gpu",
+            "--window-size=1920,1080",
+        ]
+
+    async def search_movie(self, query):
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch(headless=HEADLESS_MODE, args=self.get_stealth_args())
+                context = await browser.new_context(user_agent=self.ua.random, viewport={"width":1920,"height":1080})
+                page = await context.new_page()
                 
-                if TARGET_CHAT_ID:
+                logger.info(f"🔎 Searching: {query}")
+                await page.goto("https://in.bookmyshow.com/explore/home/", timeout=60000)
+                
+                # Try multiple ways to find search
+                search_found = False
+                selectors = ["input[type='text']", "span#4", "span:has-text('Search')"]
+                for s in selectors:
                     try:
-                        await app.bot.send_message(chat_id=TARGET_CHAT_ID, text=msg, parse_mode='HTML')
-                        if screenshot and os.path.exists(screenshot):
-                            with open(screenshot, 'rb') as photo:
-                                await app.bot.send_photo(chat_id=TARGET_CHAT_ID, photo=photo)
-                            os.remove(screenshot)
-                    except Exception as e:
-                        logger.error(f"❌ Telegram Error: {e}")
+                        if await page.locator(s).first.is_visible(timeout=2000):
+                            await page.locator(s).first.click()
+                            search_found = True
+                            break
+                    except: continue
                 
-                await asyncio.sleep(900) # Sleep 15 mins if found
-            else:
-                # Random jitter to avoid detection
-                await asyncio.sleep(CHECK_INTERVAL + random.randint(1, 15))
+                await page.locator("input").fill(query)
+                await asyncio.sleep(6) # Increased wait for cloud lag
 
-        except Exception as e:
-            logger.error(f"⚠️ Loop Error: {e}")
-            await asyncio.sleep(60)
+                await page.wait_for_selector("a[href*='/movies/']", timeout=15000)
+                links = await page.locator("a[href*='/movies/']").all()
+
+                results = []
+                for link in links[:5]:
+                    url = await link.get_attribute("href")
+                    title = await link.inner_text()
+                    if title and url:
+                        if "bookmyshow.com" not in url:
+                            url = "https://in.bookmyshow.com" + url
+                        results.append({"title": title.strip(), "url": url})
+                
+                await browser.close()
+                return results
+            except Exception as e:
+                logger.error(f"Search Error: {e}")
+                return []
+
+    async def fetch_movie_data(self, url, city):
+        data = {}
+        error = None
+        
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch(headless=HEADLESS_MODE, args=self.get_stealth_args())
+                context = await browser.new_context(user_agent=self.ua.random, locale="en-IN")
+                page = await context.new_page()
+                
+                logger.info(f"🌍 Fetching: {url}")
+                response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                
+                if response.status == 403:
+                    raise Exception("403 Forbidden")
+
+                try:
+                    if await page.get_by_placeholder("Search for your city").is_visible(timeout=5000):
+                        await page.get_by_placeholder("Search for your city").fill(city)
+                        await page.get_by_text(city, exact=False).first.click()
+                        await asyncio.sleep(3)
+                except: pass
+
+                await asyncio.sleep(3)
+                if not await page.get_by_text("No shows available").is_visible():
+                    venue_elements = await page.locator("li.list-group-item").all()
+                    for venue in venue_elements:
+                        name = await venue.locator("a.body-text").first.inner_text()
+                        times = await venue.locator(".showtime-pill .time-text").all_inner_texts()
+                        if times:
+                            data[name] = sorted([t.strip() for t in times])
+                
+                await browser.close()
+            except Exception as e:
+                error = str(e)
+                logger.error(f"Fetch Error: {e}")
+        
+        return data, error
+
+browser_manager = BrowserManager()
+
+# ================= HANDLERS =================
+SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE, MANUAL_URL = range(5)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(
-        f"👋 <b>Bot is Online!</b>\n"
-        f"Monitoring: {MOVIE_NAME}\n"
-        f"Chat ID: <code>{update.effective_chat.id}</code>"
-    )
+    db.update_user(update.effective_user.id, update.effective_chat.id)
+    await update.message.reply_text("👋 Bot is Online! Use /setup to start.")
 
-# --- MAIN ---
+async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎬 Enter Movie Name:")
+    return SEARCH
+
+async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("🔎 Searching... (Waiting 10s for results)")
+    results = await browser_manager.search_movie(update.message.text)
+    
+    # 🟢 FIX: If search fails, ask for URL directly
+    if not results:
+        await msg.edit_text("❌ No movies found via search.\n\n🔗 **Please paste the full BookMyShow movie link:**")
+        return MANUAL_URL
+    
+    keyboard = [[InlineKeyboardButton(r['title'], callback_data=f"m_{i}")] for i, r in enumerate(results)]
+    context.user_data["results"] = results
+    await msg.edit_text("Select Movie:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SELECT_MOVIE
+
+# 🟢 NEW: Handles Manual Link Parsing
+async def manual_url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if "bookmyshow.com" not in url:
+        await update.message.reply_text("❌ Invalid Link. Please paste a valid BookMyShow URL:")
+        return MANUAL_URL
+    
+    # Fake a movie object
+    context.user_data["movie"] = {"title": "Manual Selection", "url": url}
+    await update.message.reply_text(f"✅ Link Accepted!\n\n📍 Enter City (e.g., Chennai):")
+    return SELECT_CITY
+
+async def movie_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split("_")[1])
+    context.user_data["movie"] = context.user_data["results"][idx]
+    await query.edit_message_text(f"Selected: {context.user_data['movie']['title']}\n\n📍 Enter City (e.g., Chennai):")
+    return SELECT_CITY
+
+async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["city"] = update.message.text
+    btns = [[InlineKeyboardButton("Theatres", callback_data="THEATRE"), InlineKeyboardButton("Shows", callback_data="SHOW"), InlineKeyboardButton("Both", callback_data="BOTH")]]
+    await update.message.reply_text("🔔 Notify on:", reply_markup=InlineKeyboardMarkup(btns))
+    return SELECT_MODE
+
+async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    data = context.user_data
+    db.update_user(user.id, query.message.chat_id, movie_name=data["movie"]["title"], movie_url=data["movie"]["url"], city=data["city"], notify_mode=query.data)
+    db.save_snapshot(user.id, {})
+    await query.edit_message_text("✅ Setup Complete! I will check every 3 minutes.")
+    return ConversationHandler.END
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = db.get_active_users()
+    active = next((u for u in users if u['user_id'] == update.effective_user.id), None)
+    await update.message.reply_text(f"🟢 Monitoring: {active['movie_name']}" if active else "🔴 Not monitoring.")
+
+async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.stop_monitoring(update.effective_user.id)
+    await update.message.reply_text("🛑 Stopped.")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚫 Cancelled.")
+    return ConversationHandler.END
+
+# ================= BACKGROUND TASK =================
+async def monitor_task(app: Application):
+    logger.info("🟢 Background Task Started")
+    while True:
+        try:
+            users = db.get_active_users()
+            if users:
+                for user in users:
+                    await asyncio.sleep(10) 
+                    logger.info(f"Checking {user['movie_name']} for {user['user_id']}")
+                    curr, err = await browser_manager.fetch_movie_data(user['movie_url'], user['city'])
+                    
+                    if not err:
+                        last = db.get_snapshot(user['user_id'])
+                        new_theatres = [t for t in curr if t not in last]
+                        
+                        msg = ""
+                        if user['notify_mode'] in ['THEATRE', 'BOTH'] and new_theatres:
+                            msg = f"🚨 **New Theatres:**\n" + "\n".join(new_theatres)
+                        
+                        if msg:
+                            await app.bot.send_message(user['chat_id'], msg)
+                            db.save_snapshot(user['user_id'], curr)
+                        elif curr != last:
+                            db.save_snapshot(user['user_id'], curr)
+
+            await asyncio.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            logger.error(f"Monitor Crash: {e}")
+            await asyncio.sleep(60)
+
+async def post_init(app: Application):
+    asyncio.create_task(monitor_task(app))
+
+# ================= MAIN =================
 def main():
-    # 1. INSTALL BROWSER FIRST
-    install_browser()
-
-    if not TOKEN:
-        logger.critical("❌ FATAL: BOT_TOKEN is missing!")
-        return
-
-    # 2. NETWORK CONFIG (Robust)
-    request_config = HTTPXRequest(
-        connection_pool_size=8,
-        connect_timeout=60.0,
-        read_timeout=60.0,
-        write_timeout=60.0,
-        pool_timeout=60.0,
-        http_version="1.1"
-    )
-
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .request(request_config)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-
-    async def post_init(app: Application):
-        asyncio.create_task(monitor_task(app))
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN missing")
+        sys.exit(1)
     
-    application.post_init = post_init
-
-    logger.info("🚀 Bot is starting...")
+    db.init_db()
     
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        bootstrap_retries=-1
+    request = HTTPXRequest(connect_timeout=60, read_timeout=60)
+    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", setup_start)],
+        states={
+            SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler)],
+            MANUAL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_url_handler)],
+            SELECT_MOVIE: [CallbackQueryHandler(movie_select_handler)],
+            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
+            SELECT_MODE: [CallbackQueryHandler(mode_handler)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
     )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("stop", stop_monitoring))
+    app.add_handler(conv)
+
+    print("🚀 Bot Started (Clean Logs + Link Support)")
+    
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except telegram_error.Conflict:
+        logger.warning("⚠️ Conflict detected. Retrying...")
+        import time
+        time.sleep(10)
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
