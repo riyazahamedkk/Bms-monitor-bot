@@ -3,23 +3,35 @@ import time
 import json
 import hashlib
 import requests
+from urllib.parse import urlparse
 
+# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MOVIE_CODE = os.getenv("MOVIE_CODE")
-CITY = os.getenv("CITY", "bengaluru")
+MOVIE_URL = os.getenv("MOVIE_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
 print("🔍 ENV CHECK")
 print("BOT_TOKEN:", "SET" if BOT_TOKEN else "MISSING")
-print("MOVIE_CODE:", MOVIE_CODE)
-print("CITY:", CITY)
+print("MOVIE_URL:", MOVIE_URL)
 print("CHECK_INTERVAL:", CHECK_INTERVAL)
 
-if not BOT_TOKEN or not MOVIE_CODE:
-    print("❌ Missing env vars. Waiting...")
+if not BOT_TOKEN or not MOVIE_URL:
+    print("❌ Missing env vars. Waiting…")
     while True:
         time.sleep(60)
 
+# ================= PARSE MOVIE_URL =================
+# Example:
+# https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109
+parts = urlparse(MOVIE_URL).path.strip("/").split("/")
+
+CITY = parts[2]
+MOVIE_CODE = parts[5]
+
+print("🎯 Parsed CITY:", CITY)
+print("🎬 Parsed MOVIE_CODE:", MOVIE_CODE)
+
+# ================= CONFIG =================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
 CHAT_ID = None
@@ -34,6 +46,8 @@ HEADERS = {
     "Accept": "application/json"
 }
 
+# ======================================
+
 
 def get_chat_id():
     global CHAT_ID
@@ -47,7 +61,7 @@ def send_message(text):
     if CHAT_ID is None:
         get_chat_id()
         if CHAT_ID is None:
-            print("⏳ Waiting for /start in Telegram…")
+            print("⏳ Send /start to the bot in Telegram")
             return
 
     requests.post(
@@ -91,8 +105,8 @@ def monitor():
 
             if prev_fp and cur_fp != prev_fp:
                 send_message(
-                    "🚨 JANA NAYAGAN UPDATE!\n\n"
-                    "🎭 New theatre or showtime detected.\n"
+                    "🚨 JANA NAYAGAN UPDATE DETECTED!\n\n"
+                    "🎭 New theatre or showtime added\n"
                     "🎟️ Check BookMyShow now!"
                 )
                 print("✅ Change detected → Notification sent")
