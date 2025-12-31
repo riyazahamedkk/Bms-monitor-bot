@@ -55,31 +55,20 @@ def send_message(text):
         print(f"❌ Failed to send message: {e}")
 
 def fetch_data():
-    # OPTION A: PROXY MODE (ScraperAPI)
     if SCRAPER_API_KEY:
         try:
             payload = {
                 'api_key': SCRAPER_API_KEY,
                 'url': MOVIE_URL,
                 'country_code': 'in',
-                'premium': 'true',  # Use High-Quality Residential IPs
-                'render': 'true',   # 🚨 FORCE BROWSER RENDERING (Fixes blank pages)
+                'premium': 'true',
+                'render': 'true', 
             }
-            # Increased timeout to 80s because 'render=true' is slower but safer
             r = requests.get('http://api.scraperapi.com', params=payload, timeout=80)
-            
-            if r.status_code == 200: 
-                return r.text
-            
+            if r.status_code == 200: return r.text
             print(f"⚠️ Proxy Status: {r.status_code}")
-            # If 403/500, print a snippet to see what happened
-            if r.status_code in [403, 500]:
-                print(f"⚠️ Error Content: {r.text[:200]}")
-
         except Exception as e:
             print(f"⚠️ Proxy Error: {e}")
-
-    # OPTION B: DIRECT MODE
     else:
         try:
             r = curl_requests.get(MOVIE_URL, impersonate="safari15_5", timeout=20)
@@ -94,12 +83,11 @@ def extract_hash(html):
     if not html: return None
     soup = BeautifulSoup(html, "html.parser")
     
-    # 🔍 DEBUG: Print title to confirm we are running NEW code
     page_title = soup.title.string.strip() if soup.title else "No Title"
-    print(f"📄 DEBUG: Page Title is '{page_title}'")
+    print(f"📄 DEBUG: Title is '{page_title}'")
 
     if "Just a moment" in page_title or "Access Denied" in page_title:
-        print("⚠️ BLOCKED: Cloudflare is stopping us.")
+        print("⚠️ BLOCKED: Cloudflare.")
         return None
 
     data_points = []
@@ -114,8 +102,16 @@ def extract_hash(html):
     if script:
         data_points.append(hashlib.md5(script.string.encode()).hexdigest())
 
+    # 🚨 LOGIC FIX:
+    # If the title is correct but 0 venues found, it means "Coming Soon".
+    # We return a valid hash for "Empty State" so that when it changes, we get alerted.
     if not data_points:
-        return None
+        if "Jana Nayagan" in page_title:
+             print("ℹ️ Page is valid, but NO SHOWS found yet (Coming Soon).")
+             # We create a fake hash for '0 shows' so the bot has a baseline
+             return hashlib.sha256(b"NO_SHOWS_YET").hexdigest()
+        else:
+             return None
 
     print(f"📊 Success! Found {len(venues)} theatres.")
     raw = json.dumps(sorted(data_points))
@@ -132,7 +128,7 @@ def save_state(h):
         json.dump({"hash": h}, f)
 
 def monitor():
-    print("🟢 Monitor Started (v3 - Ultra Stealth)")
+    print("🟢 Monitor Started (Fixed Logic)")
     last_hash = load_state()
 
     while True:
@@ -143,17 +139,17 @@ def monitor():
             
             if current_hash:
                 if last_hash and current_hash != last_hash:
-                    msg = f"🚨 *UPDATE DETECTED*\n\nChanges on BookMyShow!\n🔗 {MOVIE_URL}"
+                    msg = f"🚨 *UPDATE DETECTED*\n\nStatus Changed on BookMyShow!\n(Likely shows added or removed)\n🔗 {MOVIE_URL}"
                     send_message(msg)
                     print("✅ Change detected!")
                 elif not last_hash:
-                    print("ℹ️ Baseline set.")
+                    print("ℹ️ Baseline set (First Run).")
                 else:
                     print("💤 No changes.")
                 save_state(current_hash)
                 last_hash = current_hash
             else:
-                print("⚠️ HTML loaded, but data extraction failed (Check Page Title above).")
+                print("⚠️ Retrying... (Page load issue)")
         
         time.sleep(CHECK_INTERVAL)
 
