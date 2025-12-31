@@ -1,112 +1,82 @@
 import os
+import time
+import json
 import requests
-from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+import hashlib
+from telegram import Bot
 
-# ================= ENV =================
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MOVIE_CODE = os.getenv("MOVIE_CODE")
-CITY = os.getenv("CITY", "bengaluru")
+MOVIE_URL = os.getenv("MOVIE_URL")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
-if not BOT_TOKEN or not MOVIE_CODE:
-    raise RuntimeError("Missing BOT_TOKEN or MOVIE_CODE")
+if not BOT_TOKEN or not MOVIE_URL:
+    raise RuntimeError("Missing BOT_TOKEN or MOVIE_URL")
 
-BASE_URL = f"https://in.bookmyshow.com/movies/{CITY}/jana-nayagan/buytickets/{MOVIE_CODE}"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+bot = Bot(token=BOT_TOKEN)
 
-last_snapshot = set()
-subscribers = set()
+STATE_FILE = "state.json"
+# =========================================
 
-# ================= SCRAPER =================
-def scrape_shows():
+
+def send_message(text: str):
     try:
-        r = requests.get(BASE_URL, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return set()
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        result = set()
-
-        for theatre in soup.select('[data-testid="theatre-card"]'):
-            name = theatre.select_one("h3, h4")
-            if not name:
-                continue
-
-            theatre_name = name.get_text(strip=True)
-
-            for show in theatre.select("a[href*='/buytickets/']"):
-                time_txt = show.get_text(strip=True)
-                link = show.get("href", "").split("?")[0]
-                result.add(f"{theatre_name} | {time_txt} | {link}")
-
-        return result
+        bot.send_message(chat_id="@JanaNayaganAlert", text=text)
     except Exception as e:
-        print("SCRAPE ERROR:", e)
-        return set()
+        print("Telegram error:", e)
 
-# ================= MONITOR =================
-async def monitor(context: ContextTypes.DEFAULT_TYPE):
-    global last_snapshot
 
-    current = scrape_shows()
-    if not current:
-        return
+def fetch_page():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    r = requests.get(MOVIE_URL, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
 
-    if last_snapshot:
-        diff = current - last_snapshot
-        if diff:
-            theatres = {x.split("|")[0].strip() for x in diff}
-            msg = (
-                "🎬 *Jana Nayagan – New Shows Added!*\n\n"
-                f"🎭 Theatres: {len(theatres)}\n"
-                f"🎟 Shows: {len(diff)}\n\n"
-                f"🔗 {BASE_URL}"
-            )
 
-            for chat_id in subscribers:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=msg,
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    print("SEND ERROR:", e)
+def fingerprint(html: str):
+    return hashlib.sha256(html.encode("utf-8")).hexdigest()
 
-    last_snapshot = current
 
-# ================= COMMANDS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subscribers.add(update.effective_chat.id)
-    await update.message.reply_text(
-        "🟢 Jana Nayagan Monitor ON\n\n"
-        f"⏱ Checking every {CHECK_INTERVAL} seconds.\n"
-        "You’ll be alerted when NEW shows or theatres appear."
-    )
+def load_previous():
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE, "r") as f:
+        return json.load(f).get("fingerprint")
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🟢 Running\nCity: {CITY}\nInterval: {CHECK_INTERVAL}s"
-    )
 
-# ================= MAIN =================
-def main():
-    print("🟢 Telegram BookMyShow bot started")
+def save_current(fp):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"fingerprint": fp}, f)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
+def monitor_loop():
+    print("🟢 Telegram BookMyShow monitor started")
 
-    app.job_queue.run_repeating(monitor, interval=CHECK_INTERVAL, first=10)
+    previous_fp = load_previous()
 
-    app.run_polling()
+    while True:
+        try:
+            html = fetch_page()
+            current_fp = fingerprint(html)
+
+            if previous_fp and current_fp != previous_fp:
+                send_message(
+                    "🚨 **JANA NAYAGAN UPDATE DETECTED**\n\n"
+                    "🎭 New theatre or showtime added!\n"
+                    "🎟️ Book immediately on BookMyShow!"
+                )
+                print("✅ Change detected → Notification sent")
+
+            previous_fp = current_fp
+            save_current(current_fp)
+
+        except Exception as e:
+            print("Monitor error:", e)
+
+        time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
-    main()
+    monitor_loop()
