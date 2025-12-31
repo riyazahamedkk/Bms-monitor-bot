@@ -18,6 +18,7 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+from telegram.request import HTTPXRequest  # 🟢 Added for timeout fix
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from fake_useragent import UserAgent
 
@@ -31,7 +32,6 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 USER_DATA_DIR = "./browser_data" 
 
 # Database Path (Railway Persistence Check)
-# If a volume is mounted at /app/data, use it. Otherwise, use local file.
 if os.path.exists("/app/data"):
     DB_FILE = "/app/data/monitor.db"
 else:
@@ -174,11 +174,14 @@ class BrowserManager:
                     await search_box.click(force=True, timeout=5000)
                 except:
                     # Fallback for mobile view or different layout
-                    await page.get_by_role("button", name="Search").click()
+                    try:
+                        await page.get_by_role("button", name="Search").click()
+                    except:
+                        pass # Search might already be open
                 
                 input_field = page.locator("input")
                 await input_field.fill(query)
-                await asyncio.sleep(2) 
+                await asyncio.sleep(3) 
 
                 # Scrape results
                 await page.wait_for_selector("a[href*='/movies/']", timeout=10000)
@@ -369,7 +372,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("🔴 Not monitoring.")
 
-# ================= BACKGROUND TASK (FIXED) =================
+# ================= BACKGROUND TASK =================
 async def monitor_task(app: Application):
     """
     Background task managed by post_init.
@@ -447,8 +450,11 @@ def main():
         
     db.init_db()
 
+    # 🟢 FIXED: Increase timeouts to prevent "Timed Out" errors on Railway
+    t_request = HTTPXRequest(connection_pool_size=8, connect_timeout=60, read_timeout=60)
+
     # 🟢 FIXED: Use post_init to avoid 'No Event Loop' warnings
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).request(t_request).post_init(post_init).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("setup", setup_start)],
@@ -466,8 +472,14 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
+    
+    # 🟢 FIXED: Error handler to log errors instead of crashing
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-    print("🚀 Bot deployed on Railway! (Stealth Mode)")
+    app.add_error_handler(error_handler)
+
+    print("🚀 Bot deployed on Railway! (Stealth Mode + High Timeout)")
     app.run_polling()
 
 if __name__ == "__main__":
