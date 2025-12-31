@@ -18,7 +18,8 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
-from telegram.request import HTTPXRequest  # 🟢 Added for timeout fix
+# 🟢 CRITICAL IMPORT FOR NETWORK FIX
+from telegram.request import HTTPXRequest 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from fake_useragent import UserAgent
 
@@ -173,11 +174,10 @@ class BrowserManager:
                     search_box = page.locator("span#4, input[type='text']").first
                     await search_box.click(force=True, timeout=5000)
                 except:
-                    # Fallback for mobile view or different layout
                     try:
                         await page.get_by_role("button", name="Search").click()
                     except:
-                        pass # Search might already be open
+                        pass 
                 
                 input_field = page.locator("input")
                 await input_field.fill(query)
@@ -231,11 +231,9 @@ class BrowserManager:
                 logger.info(f"🌍 Fetching: {url} | UA: {user_agent[:20]}...")
                 response = await page.goto(url, timeout=90000, wait_until="domcontentloaded")
                 
-                # Check for Block
                 if response.status == 403:
                     raise Exception("BMS Blocked Request (403)")
 
-                # Handle City Modal
                 try:
                     city_input = page.get_by_placeholder("Search for your city")
                     if await city_input.is_visible(timeout=5000):
@@ -245,12 +243,10 @@ class BrowserManager:
                 except PlaywrightTimeout:
                     pass
 
-                # Check "No Shows"
                 if await page.get_by_text("No shows available").is_visible():
                     await browser.close()
                     return {}, None
 
-                # Scrape Venues
                 try:
                     await page.wait_for_selector("li.list-group-item", timeout=10000)
                 except:
@@ -286,7 +282,6 @@ SEARCH, SELECT_MOVIE, SELECT_CITY, SELECT_MODE = range(4)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # 🟢 FIXED: Safe DB update
     db.update_user(user.id, update.effective_chat.id)
     
     await update.message.reply_text(
@@ -386,7 +381,6 @@ async def monitor_task(app: Application):
                 continue
 
             for user in users:
-                # Random jitter (5-15s) to avoid bot detection patterns
                 await asyncio.sleep(random.uniform(5, 15))
                 
                 try:
@@ -398,7 +392,6 @@ async def monitor_task(app: Application):
 
                     last_data = db.get_snapshot(user['user_id'])
                     
-                    # Logic: New Theatres vs New Shows
                     new_theatres = [t for t in current_data if t not in last_data]
                     new_shows = {}
                     
@@ -423,7 +416,6 @@ async def monitor_task(app: Application):
                         await app.bot.send_message(user['chat_id'], msg, parse_mode='Markdown')
                         db.save_snapshot(user['user_id'], current_data)
                     elif current_data != last_data:
-                        # Quiet update (e.g. removed shows)
                         db.save_snapshot(user['user_id'], current_data)
 
                 except Exception as e:
@@ -437,9 +429,6 @@ async def monitor_task(app: Application):
 
 # ================= STARTUP HOOK =================
 async def post_init(application: Application):
-    """
-    Correctly starts the background task after bot init.
-    """
     asyncio.create_task(monitor_task(application))
 
 # ================= MAIN =================
@@ -450,10 +439,15 @@ def main():
         
     db.init_db()
 
-    # 🟢 FIXED: Increase timeouts to prevent "Timed Out" errors on Railway
-    t_request = HTTPXRequest(connection_pool_size=8, connect_timeout=60, read_timeout=60)
+    # 🚀 FIX: Super Aggressive Network Settings for Railway
+    t_request = HTTPXRequest(
+        connection_pool_size=10,
+        connect_timeout=120.0,  # 2 minutes
+        read_timeout=120.0,     # 2 minutes
+        write_timeout=120.0,
+        pool_timeout=120.0
+    )
 
-    # 🟢 FIXED: Use post_init to avoid 'No Event Loop' warnings
     app = Application.builder().token(BOT_TOKEN).request(t_request).post_init(post_init).build()
 
     conv = ConversationHandler(
@@ -465,7 +459,7 @@ def main():
             SELECT_MODE: [CallbackQueryHandler(mode_handler)]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False # 🟢 FIXED: Silences PTBUserWarning
+        per_message=False 
     )
 
     app.add_handler(CommandHandler("start", start))
@@ -473,13 +467,16 @@ def main():
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
     
-    # 🟢 FIXED: Error handler to log errors instead of crashing
+    # 🟢 Smart Error Handler: Hides temporary network errors
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.error(msg="Exception while handling an update:", exc_info=context.error)
+        if "TimedOut" in str(context.error) or "ConnectTimeout" in str(context.error):
+            logger.warning(f"⚠️ Network Timeout (Retrying...): {context.error}")
+        else:
+            logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
     app.add_error_handler(error_handler)
 
-    print("🚀 Bot deployed on Railway! (Stealth Mode + High Timeout)")
+    print("🚀 Bot deployed on Railway! (Aggressive Network Mode)")
     app.run_polling()
 
 if __name__ == "__main__":
