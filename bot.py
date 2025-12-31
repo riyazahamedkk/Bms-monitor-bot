@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # Railway Settings
 HEADLESS_MODE = True
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180")) # Increased to 3 mins to save RAM
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180")) 
 USER_DATA_DIR = "./browser_data" 
 
 # Database Path
@@ -36,7 +36,7 @@ if os.path.exists("/app/data"):
 else:
     DB_FILE = "monitor.db"
 
-# ================= LOGGING (FIXED FOR RAILWAY) =================
+# ================= LOGGING =================
 # Force unbuffered output so logs appear instantly
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -121,7 +121,7 @@ class Database:
 
 db = Database(DB_FILE)
 
-# ================= BROWSER MANAGER (RAM OPTIMIZED) =================
+# ================= BROWSER MANAGER =================
 class BrowserManager:
     def __init__(self):
         self.ua = UserAgent()
@@ -131,7 +131,7 @@ class BrowserManager:
             "--disable-blink-features=AutomationControlled",
             "--disable-infobars",
             "--no-sandbox",
-            "--disable-dev-shm-usage", # CRITICAL for Docker/Railway
+            "--disable-dev-shm-usage", 
             "--disable-gpu",
             "--disable-extensions",
             "--window-size=1280,720",
@@ -179,7 +179,6 @@ class BrowserManager:
         
         async with async_playwright() as p:
             try:
-                # Launch FRESH browser every time to prevent memory leaks
                 browser = await p.chromium.launch(headless=HEADLESS_MODE, args=self.get_stealth_args())
                 context = await browser.new_context(user_agent=self.ua.random, locale="en-IN")
                 page = await context.new_page()
@@ -190,7 +189,6 @@ class BrowserManager:
                 if response.status == 403:
                     raise Exception("403 Forbidden")
 
-                # Handle City
                 try:
                     if await page.get_by_placeholder("Search for your city").is_visible(timeout=3000):
                         await page.get_by_placeholder("Search for your city").fill(city)
@@ -198,7 +196,6 @@ class BrowserManager:
                         await asyncio.sleep(2)
                 except: pass
 
-                # Check Shows
                 if not await page.get_by_text("No shows available").is_visible():
                     try:
                         await page.wait_for_selector("li.list-group-item", timeout=10000)
@@ -321,9 +318,7 @@ def main():
     
     db.init_db()
     
-    # SAFE REQUEST SETTINGS (Standard 60s timeout)
     request = HTTPXRequest(connect_timeout=60, read_timeout=60)
-    
     app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
     conv = ConversationHandler(
@@ -343,7 +338,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
 
-    print("🚀 Bot Started with LOG FLUSHING ENABLED")
+    print("🚀 Bot Started with ENV FIX")
     app.run_polling()
 
 if __name__ == "__main__":
