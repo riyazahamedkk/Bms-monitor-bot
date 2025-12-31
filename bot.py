@@ -8,8 +8,8 @@ from urllib.parse import urlparse
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MOVIE_URL = os.getenv("MOVIE_URL")
-# Default to 60s to be safe from rate limits
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) 
+# Increased default check interval to 60s to avoid rate limits
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 
 print("🔍 ENV CHECK")
 print("BOT_TOKEN:", "SET" if BOT_TOKEN else "MISSING")
@@ -34,12 +34,10 @@ try:
 
     print(f"🎯 Parsed CITY: {CITY}")
     print(f"🎬 Parsed CODE: {MOVIE_CODE}")
-    if DATE_CODE:
-        print(f"📅 Monitoring Date: {DATE_CODE}")
 
 except Exception as e:
     print(f"❌ Error parsing URL: {e}")
-    # Fallback/Exit if parsing fails
+    # Stop execution if URL is wrong
     raise SystemExit("Check your MOVIE_URL format.")
 
 # ================= CONFIG =================
@@ -47,13 +45,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
 CHAT_ID = None
 
-# Using the public 'synopsis' API as it is less strictly rate-limited 
-# than the booking API, but allows checking if tickets are live.
-# Alternatively, we revert to the HTML page check which is often more robust for 403s.
-# For this fix, I will use a reliable internal endpoint structure.
+# Using the standard API endpoint
 API_URL = f"https://in.bookmyshow.com/api/explore/v1/movies/{MOVIE_CODE}/showtimes?region={CITY}&bmsId={MOVIE_CODE}"
 
-# 🚨 IMPORTANT: Pretend to be a Desktop Browser, not the App
+# 🚨 IMPORTANT: Pretend to be a Desktop Browser (Chrome), NOT the App
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
@@ -90,12 +85,12 @@ def send_message(text):
         print(f"❌ Failed to send message: {e}")
 
 def fetch_show_data():
-    # We use a session to manage cookies automatically
+    # Use a session to look more like a real user
     with requests.Session() as s:
         s.headers.update(HEADERS)
         r = s.get(API_URL, timeout=15)
         
-        # If still 403, it means they are blocking the IP or specific API path
+        # If still 403, warn the user explicitly
         if r.status_code == 403:
             print("⚠️ 403 Forbidden. The server is blocking the request.")
             return None
@@ -104,7 +99,6 @@ def fetch_show_data():
         return r.json()
 
 def fingerprint(data):
-    # Create a unique hash of the data
     raw = json.dumps(data, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
