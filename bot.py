@@ -8,7 +8,7 @@ import random
 from datetime import datetime
 
 # Third-party imports
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error as telegram_error
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -37,7 +37,6 @@ else:
     DB_FILE = "monitor.db"
 
 # ================= LOGGING =================
-# Force unbuffered output so logs appear instantly
 sys.stdout.reconfigure(encoding='utf-8')
 
 logging.basicConfig(
@@ -121,7 +120,7 @@ class Database:
 
 db = Database(DB_FILE)
 
-# ================= BROWSER MANAGER =================
+# ================= BROWSER MANAGER (ROBUST SEARCH) =================
 class BrowserManager:
     def __init__(self):
         self.ua = UserAgent()
@@ -134,28 +133,49 @@ class BrowserManager:
             "--disable-dev-shm-usage", 
             "--disable-gpu",
             "--disable-extensions",
-            "--window-size=1280,720",
+            "--window-size=1920,1080", # HD Res helps with layout
         ]
 
     async def search_movie(self, query):
         async with async_playwright() as p:
             try:
                 browser = await p.chromium.launch(headless=HEADLESS_MODE, args=self.get_stealth_args())
-                context = await browser.new_context(user_agent=self.ua.random, viewport={"width":1280,"height":720})
+                context = await browser.new_context(user_agent=self.ua.random, viewport={"width":1920,"height":1080})
                 page = await context.new_page()
                 
                 logger.info(f"🔎 Searching: {query}")
-                await page.goto("https://in.bookmyshow.com/explore/home/", timeout=45000)
+                # 1. Go to Home
+                await page.goto("https://in.bookmyshow.com/explore/home/", timeout=60000)
                 
-                try:
-                    await page.locator("span#4, input[type='text']").first.click(timeout=5000)
-                except:
-                    pass
+                # 2. Aggressively find search bar
+                search_found = False
+                potential_selectors = [
+                    "input[type='text']", 
+                    "span#4", 
+                    "div.sc-fFTswy", # Common random class
+                    "span:has-text('Search')",
+                ]
                 
-                await page.locator("input").fill(query)
-                await asyncio.sleep(2) 
+                for selector in potential_selectors:
+                    try:
+                        if await page.locator(selector).first.is_visible(timeout=2000):
+                            await page.locator(selector).first.click(timeout=1000)
+                            search_found = True
+                            break
+                    except: continue
 
-                await page.wait_for_selector("a[href*='/movies/']", timeout=10000)
+                # Fallback: Just type if we think we are focused, or force click center
+                if not search_found:
+                    logger.warning("⚠️ Search bar elusive, trying generic input fill...")
+                
+                # 3. Type and Wait
+                await page.locator("input").fill(query)
+                
+                # 4. Wait longer for AJAX results (Cloud is slow)
+                await asyncio.sleep(5) 
+
+                # 5. Extract
+                await page.wait_for_selector("a[href*='/movies/']", timeout=15000)
                 links = await page.locator("a[href*='/movies/']").all()
 
                 results = []
@@ -189,23 +209,29 @@ class BrowserManager:
                 if response.status == 403:
                     raise Exception("403 Forbidden")
 
+                # Handle City Selection
                 try:
-                    if await page.get_by_placeholder("Search for your city").is_visible(timeout=3000):
+                    if await page.get_by_placeholder("Search for your city").is_visible(timeout=5000):
                         await page.get_by_placeholder("Search for your city").fill(city)
                         await page.get_by_text(city, exact=False).first.click()
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(3)
                 except: pass
 
-                if not await page.get_by_text("No shows available").is_visible():
-                    try:
-                        await page.wait_for_selector("li.list-group-item", timeout=10000)
+                # Check for "No Shows" or "Venues"
+                try:
+                    # Wait for container to stabilize
+                    await asyncio.sleep(3)
+                    
+                    if await page.get_by_text("No shows available").is_visible():
+                        pass # Valid result, just empty
+                    else:
                         venue_elements = await page.locator("li.list-group-item").all()
                         for venue in venue_elements:
                             name = await venue.locator("a.body-text").first.inner_text()
                             times = await venue.locator(".showtime-pill .time-text").all_inner_texts()
                             if times:
                                 data[name] = sorted([t.strip() for t in times])
-                    except: pass
+                except: pass
                 
                 await browser.close()
             except Exception as e:
@@ -228,10 +254,10 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SEARCH
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🔎 Searching...")
+    msg = await update.message.reply_text("🔎 Searching... (Waiting 10s for results)")
     results = await browser_manager.search_movie(update.message.text)
     if not results:
-        await msg.edit_text("❌ No movies found.")
+        await msg.edit_text("❌ No movies found. Try searching for a simpler term (e.g. 'Jana').")
         return SEARCH
     
     keyboard = [[InlineKeyboardButton(r['title'], callback_data=f"m_{i}")] for i, r in enumerate(results)]
@@ -244,7 +270,7 @@ async def movie_select_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     idx = int(query.data.split("_")[1])
     context.user_data["movie"] = context.user_data["results"][idx]
-    await query.edit_message_text(f"Selected: {context.user_data['movie']['title']}\n\n📍 Enter City:")
+    await query.edit_message_text(f"Selected: {context.user_data['movie']['title']}\n\n📍 Enter City (e.g., Chennai):")
     return SELECT_CITY
 
 async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -260,7 +286,7 @@ async def mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
     db.update_user(user.id, query.message.chat_id, movie_name=data["movie"]["title"], movie_url=data["movie"]["url"], city=data["city"], notify_mode=query.data)
     db.save_snapshot(user.id, {})
-    await query.edit_message_text("✅ Setup Complete! I will check periodically.")
+    await query.edit_message_text("✅ Setup Complete! I will check every 3 minutes.")
     return ConversationHandler.END
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +310,7 @@ async def monitor_task(app: Application):
             users = db.get_active_users()
             if users:
                 for user in users:
-                    await asyncio.sleep(10) # Wait between users
+                    await asyncio.sleep(10) 
                     logger.info(f"Checking {user['movie_name']} for {user['user_id']}")
                     curr, err = await browser_manager.fetch_movie_data(user['movie_url'], user['city'])
                     
@@ -318,6 +344,7 @@ def main():
     
     db.init_db()
     
+    # 60s timeout for stability
     request = HTTPXRequest(connect_timeout=60, read_timeout=60)
     app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
@@ -338,8 +365,16 @@ def main():
     app.add_handler(CommandHandler("stop", stop_monitoring))
     app.add_handler(conv)
 
-    print("🚀 Bot Started with ENV FIX")
-    app.run_polling()
+    print("🚀 Bot Started (Conflict Handled + Robust Search)")
+    
+    # Conflict Handling: If the old bot is still dying, we catch the error and retry
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except telegram_error.Conflict:
+        logger.warning("⚠️ Conflict detected (Old bot still running). Retrying in 10 seconds...")
+        import time
+        time.sleep(10)
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
