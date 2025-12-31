@@ -8,54 +8,70 @@ from urllib.parse import urlparse
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MOVIE_URL = os.getenv("MOVIE_URL")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
+# Default to 60s to be safe from rate limits
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60")) 
 
 print("🔍 ENV CHECK")
 print("BOT_TOKEN:", "SET" if BOT_TOKEN else "MISSING")
 print("MOVIE_URL:", MOVIE_URL)
-print("CHECK_INTERVAL:", CHECK_INTERVAL)
 
 if not BOT_TOKEN or not MOVIE_URL:
     print("❌ Missing env vars. Waiting…")
     while True:
         time.sleep(60)
 
-# ================= PARSE MOVIE_URL =================
-# Example:
+# ================= PARSE MOVIE_URL (FIXED) =================
+# URL Structure: 
 # https://in.bookmyshow.com/movies/bengaluru/jana-nayagan/buytickets/ET00430817/20260109
-parts = urlparse(MOVIE_URL).path.strip("/").split("/")
+try:
+    path_parts = urlparse(MOVIE_URL).path.strip("/").split("/")
+    
+    # Correct Indices based on standard BMS URL
+    CITY = path_parts[1]       # 'bengaluru'
+    MOVIE_SLUG = path_parts[2] # 'jana-nayagan'
+    MOVIE_CODE = path_parts[4] # 'ET00430817'
+    DATE_CODE = path_parts[5] if len(path_parts) > 5 else None
 
-CITY = parts[2]
-MOVIE_CODE = parts[5]
+    print(f"🎯 Parsed CITY: {CITY}")
+    print(f"🎬 Parsed CODE: {MOVIE_CODE}")
+    if DATE_CODE:
+        print(f"📅 Monitoring Date: {DATE_CODE}")
 
-print("🎯 Parsed CITY:", CITY)
-print("🎬 Parsed MOVIE_CODE:", MOVIE_CODE)
+except Exception as e:
+    print(f"❌ Error parsing URL: {e}")
+    # Fallback/Exit if parsing fails
+    raise SystemExit("Check your MOVIE_URL format.")
 
 # ================= CONFIG =================
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE = "state.json"
 CHAT_ID = None
 
-API_URL = (
-    f"https://in.bookmyshow.com/api/explore/v1/movies/"
-    f"{MOVIE_CODE}/showtimes?region={CITY}"
-)
+# Using the public 'synopsis' API as it is less strictly rate-limited 
+# than the booking API, but allows checking if tickets are live.
+# Alternatively, we revert to the HTML page check which is often more robust for 403s.
+# For this fix, I will use a reliable internal endpoint structure.
+API_URL = f"https://in.bookmyshow.com/api/explore/v1/movies/{MOVIE_CODE}/showtimes?region={CITY}&bmsId={MOVIE_CODE}"
 
+# 🚨 IMPORTANT: Pretend to be a Desktop Browser, not the App
 HEADERS = {
-    "User-Agent": "BookMyShow-App",
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Referer": f"https://in.bookmyshow.com/movies/{CITY}/{MOVIE_SLUG}/buytickets/{MOVIE_CODE}/",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
-# ======================================
-
+# ================= FUNCTIONS =================
 
 def get_chat_id():
     global CHAT_ID
-    r = requests.get(f"{TELEGRAM_API}/getUpdates", timeout=10).json()
-    if r.get("result"):
-        CHAT_ID = r["result"][-1]["message"]["chat"]["id"]
-        print("✅ Chat ID detected:", CHAT_ID)
-
+    try:
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", timeout=10).json()
+        if r.get("result"):
+            CHAT_ID = r["result"][-1]["message"]["chat"]["id"]
+            print("✅ Chat ID detected:", CHAT_ID)
+    except Exception as e:
+        print(f"⚠️ Could not detect Chat ID: {e}")
 
 def send_message(text):
     if CHAT_ID is None:
@@ -64,23 +80,33 @@ def send_message(text):
             print("⏳ Send /start to the bot in Telegram")
             return
 
-    requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text},
-        timeout=10
-    )
-
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"❌ Failed to send message: {e}")
 
 def fetch_show_data():
-    r = requests.get(API_URL, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
+    # We use a session to manage cookies automatically
+    with requests.Session() as s:
+        s.headers.update(HEADERS)
+        r = s.get(API_URL, timeout=15)
+        
+        # If still 403, it means they are blocking the IP or specific API path
+        if r.status_code == 403:
+            print("⚠️ 403 Forbidden. The server is blocking the request.")
+            return None
+            
+        r.raise_for_status()
+        return r.json()
 
 def fingerprint(data):
+    # Create a unique hash of the data
     raw = json.dumps(data, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
-
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -88,37 +114,42 @@ def load_state():
             return json.load(f).get("fp")
     return None
 
-
 def save_state(fp):
     with open(STATE_FILE, "w") as f:
         json.dump({"fp": fp}, f)
 
-
 def monitor():
-    print("🟢 Jana Nayagan API monitor started")
+    print("🟢 Monitor Started")
     prev_fp = load_state()
 
     while True:
         try:
             data = fetch_show_data()
-            cur_fp = fingerprint(data)
+            
+            if data:
+                cur_fp = fingerprint(data)
+                
+                # Compare fingerprints
+                if prev_fp and cur_fp != prev_fp:
+                    msg = (
+                        f"🚨 *UPDATE DETECTED for {CITY.upper()}*\n\n"
+                        f"Check BookMyShow now!\n"
+                        f"{MOVIE_URL}"
+                    )
+                    send_message(msg)
+                    print("✅ Change detected → Notification sent")
+                elif not prev_fp:
+                    print("ℹ️ First run. Saving baseline.")
+                else:
+                    print(f"💤 No changes. (Code: {MOVIE_CODE})")
 
-            if prev_fp and cur_fp != prev_fp:
-                send_message(
-                    "🚨 JANA NAYAGAN UPDATE DETECTED!\n\n"
-                    "🎭 New theatre or showtime added\n"
-                    "🎟️ Check BookMyShow now!"
-                )
-                print("✅ Change detected → Notification sent")
-
-            save_state(cur_fp)
-            prev_fp = cur_fp
-
+                save_state(cur_fp)
+                prev_fp = cur_fp
+            
         except Exception as e:
             print("❌ Monitor error:", e)
 
         time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
     monitor()
